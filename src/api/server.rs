@@ -1300,13 +1300,25 @@ async fn update_agent_config(
 
     tracing::info!(agent_id = %request.agent_id, "config.toml updated via API");
 
-    // Immediately reload RuntimeConfig so the response reflects the new values
-    // (the file watcher will also pick this up, but has a 2s debounce)
+    // Immediately reload RuntimeConfig and DiscordPermissions so the response
+    // reflects the new values (the file watcher will also pick this up, but has a 2s debounce)
     match crate::config::Config::load_from_path(&config_path) {
         Ok(new_config) => {
             let runtime_configs = state.runtime_configs.load();
             if let Some(rc) = runtime_configs.get(&request.agent_id) {
                 rc.reload_config(&new_config, &request.agent_id);
+            }
+            if request.discord.is_some() {
+                if let Some(discord_config) = &new_config.messaging.discord {
+                    let new_perms = crate::config::DiscordPermissions::from_config(
+                        discord_config,
+                        &new_config.bindings,
+                    );
+                    let perms = state.discord_permissions.read().await;
+                    if let Some(arc_swap) = perms.as_ref() {
+                        arc_swap.store(std::sync::Arc::new(new_perms));
+                    }
+                }
             }
         }
         Err(error) => {
