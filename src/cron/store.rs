@@ -19,28 +19,21 @@ impl CronStore {
 
     /// Save a cron job configuration.
     pub async fn save(&self, config: &CronConfig) -> Result<()> {
-        let active_start = config.active_hours.map(|h| h.0 as i64);
-        let active_end = config.active_hours.map(|h| h.1 as i64);
-
         sqlx::query(
             r#"
-            INSERT INTO cron_jobs (id, prompt, interval_secs, delivery_target, active_start_hour, active_end_hour, enabled)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO cron_jobs (id, prompt, schedule, delivery_target, enabled)
+            VALUES (?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 prompt = excluded.prompt,
-                interval_secs = excluded.interval_secs,
+                schedule = excluded.schedule,
                 delivery_target = excluded.delivery_target,
-                active_start_hour = excluded.active_start_hour,
-                active_end_hour = excluded.active_end_hour,
                 enabled = excluded.enabled
             "#
         )
         .bind(&config.id)
         .bind(&config.prompt)
-        .bind(config.interval_secs as i64)
+        .bind(&config.schedule)
         .bind(&config.delivery_target)
-        .bind(active_start)
-        .bind(active_end)
         .bind(config.enabled as i64)
         .execute(&self.pool)
         .await
@@ -53,7 +46,7 @@ impl CronStore {
     pub async fn load_all(&self) -> Result<Vec<CronConfig>> {
         let rows = sqlx::query(
             r#"
-            SELECT id, prompt, interval_secs, delivery_target, active_start_hour, active_end_hour, enabled
+            SELECT id, prompt, schedule, delivery_target, enabled
             FROM cron_jobs
             WHERE enabled = 1
             ORDER BY created_at ASC
@@ -68,16 +61,8 @@ impl CronStore {
             .map(|row| CronConfig {
                 id: row.try_get("id").unwrap_or_default(),
                 prompt: row.try_get("prompt").unwrap_or_default(),
-                interval_secs: row.try_get::<i64, _>("interval_secs").unwrap_or(3600) as u64,
+                schedule: row.try_get("schedule").unwrap_or_else(|_| default_schedule()),
                 delivery_target: row.try_get("delivery_target").unwrap_or_default(),
-                active_hours: {
-                    let start: Option<i64> = row.try_get("active_start_hour").ok();
-                    let end: Option<i64> = row.try_get("active_end_hour").ok();
-                    match (start, end) {
-                        (Some(s), Some(e)) => Some((s as u8, e as u8)),
-                        _ => None,
-                    }
-                },
                 enabled: row.try_get::<i64, _>("enabled").unwrap_or(1) != 0,
             })
             .collect();
@@ -138,7 +123,7 @@ impl CronStore {
     pub async fn load_all_unfiltered(&self) -> Result<Vec<CronConfig>> {
         let rows = sqlx::query(
             r#"
-            SELECT id, prompt, interval_secs, delivery_target, active_start_hour, active_end_hour, enabled
+            SELECT id, prompt, schedule, delivery_target, enabled
             FROM cron_jobs
             ORDER BY created_at ASC
             "#,
@@ -152,16 +137,8 @@ impl CronStore {
             .map(|row| CronConfig {
                 id: row.try_get("id").unwrap_or_default(),
                 prompt: row.try_get("prompt").unwrap_or_default(),
-                interval_secs: row.try_get::<i64, _>("interval_secs").unwrap_or(3600) as u64,
+                schedule: row.try_get("schedule").unwrap_or_else(|_| default_schedule()),
                 delivery_target: row.try_get("delivery_target").unwrap_or_default(),
-                active_hours: {
-                    let start: Option<i64> = row.try_get("active_start_hour").ok();
-                    let end: Option<i64> = row.try_get("active_end_hour").ok();
-                    match (start, end) {
-                        (Some(s), Some(e)) => Some((s as u8, e as u8)),
-                        _ => None,
-                    }
-                },
                 enabled: row.try_get::<i64, _>("enabled").unwrap_or(1) != 0,
             })
             .collect();
@@ -258,6 +235,10 @@ impl CronStore {
             Ok(CronExecutionStats::default())
         }
     }
+}
+
+fn default_schedule() -> String {
+    "0 * * * *".to_string()
 }
 
 /// Entry in the cron execution log.

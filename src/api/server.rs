@@ -22,6 +22,7 @@ use tower_http::cors::{Any, CorsLayer};
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
+use std::str::FromStr;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -128,10 +129,9 @@ struct HeatmapCell {
 struct CronJobInfo {
     id: String,
     prompt: String,
-    interval_secs: u64,
+    schedule: String,
     delivery_target: String,
     enabled: bool,
-    active_hours: Option<(u8, u8)>,
 }
 
 /// Instance-wide overview response for the main dashboard.
@@ -1011,7 +1011,7 @@ async fn agent_overview(
 
     // Cron jobs
     let cron_rows = sqlx::query(
-        "SELECT id, prompt, interval_secs, delivery_target, active_start_hour, active_end_hour, enabled FROM cron_jobs ORDER BY created_at ASC",
+        "SELECT id, prompt, schedule, delivery_target, enabled FROM cron_jobs ORDER BY created_at ASC",
     )
     .fetch_all(pool)
     .await
@@ -1020,18 +1020,12 @@ async fn agent_overview(
     let cron_jobs: Vec<CronJobInfo> = cron_rows
         .into_iter()
         .map(|row| {
-            let active_start: Option<i64> = row.try_get("active_start_hour").ok();
-            let active_end: Option<i64> = row.try_get("active_end_hour").ok();
             CronJobInfo {
                 id: row.get("id"),
                 prompt: row.get("prompt"),
-                interval_secs: row.get::<i64, _>("interval_secs") as u64,
+                schedule: row.try_get("schedule").unwrap_or_else(|_| "0 * * * *".to_string()),
                 delivery_target: row.get("delivery_target"),
                 enabled: row.get::<i64, _>("enabled") != 0,
-                active_hours: match (active_start, active_end) {
-                    (Some(s), Some(e)) => Some((s as u8, e as u8)),
-                    _ => None,
-                },
             }
         })
         .collect();
@@ -2179,19 +2173,15 @@ struct CreateCronRequest {
     agent_id: String,
     id: String,
     prompt: String,
-    #[serde(default = "default_interval")]
-    interval_secs: u64,
+    #[serde(default = "default_schedule")]
+    schedule: String,
     delivery_target: String,
-    #[serde(default)]
-    active_start_hour: Option<u8>,
-    #[serde(default)]
-    active_end_hour: Option<u8>,
     #[serde(default = "default_enabled")]
     enabled: bool,
 }
 
-fn default_interval() -> u64 {
-    3600
+fn default_schedule() -> String {
+    "0 * * * *".to_string()
 }
 
 fn default_enabled() -> bool {
@@ -2221,10 +2211,9 @@ struct ToggleCronRequest {
 struct CronJobWithStats {
     id: String,
     prompt: String,
-    interval_secs: u64,
+    schedule: String,
     delivery_target: String,
     enabled: bool,
-    active_hours: Option<(u8, u8)>,
     success_count: u64,
     failure_count: u64,
     last_executed_at: Option<String>,
@@ -2272,10 +2261,9 @@ async fn list_cron_jobs(
         jobs.push(CronJobWithStats {
             id: config.id,
             prompt: config.prompt,
-            interval_secs: config.interval_secs,
+            schedule: config.schedule,
             delivery_target: config.delivery_target,
             enabled: config.enabled,
-            active_hours: config.active_hours,
             success_count: stats.success_count,
             failure_count: stats.failure_count,
             last_executed_at: stats.last_executed_at,
@@ -2325,17 +2313,19 @@ async fn create_or_update_cron(
     let store = stores.get(&request.agent_id).ok_or(StatusCode::NOT_FOUND)?;
     let scheduler = schedulers.get(&request.agent_id).ok_or(StatusCode::NOT_FOUND)?;
 
-    let active_hours = match (request.active_start_hour, request.active_end_hour) {
-        (Some(start), Some(end)) => Some((start, end)),
-        _ => None,
-    };
+    // Validate the cron expression
+    if croner::Cron::from_str(&request.schedule).is_err() {
+        return Ok(Json(CronActionResponse {
+            success: false,
+            message: format!("Invalid cron expression: '{}'", request.schedule),
+        }));
+    }
 
     let config = crate::cron::CronConfig {
         id: request.id.clone(),
         prompt: request.prompt,
-        interval_secs: request.interval_secs,
+        schedule: request.schedule,
         delivery_target: request.delivery_target,
-        active_hours,
         enabled: request.enabled,
     };
 

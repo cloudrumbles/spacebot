@@ -333,11 +333,10 @@ pub struct AgentConfig {
 pub struct CronDef {
     pub id: String,
     pub prompt: String,
-    pub interval_secs: u64,
-    /// Delivery target in "adapter:target" format (e.g. "discord:123456789").
+    /// Cron expression (e.g. "0 9 * * *" for daily at 9am).
+    pub schedule: String,
+    /// Delivery target in "adapter:target" format (e.g. "telegram:525365593").
     pub delivery_target: String,
-    /// Optional active hours window (start_hour, end_hour) in 24h format.
-    pub active_hours: Option<(u8, u8)>,
     pub enabled: bool,
 }
 
@@ -1013,12 +1012,15 @@ struct TomlAgentConfig {
 struct TomlCronDef {
     id: String,
     prompt: String,
-    interval_secs: Option<u64>,
+    #[serde(default = "default_schedule")]
+    schedule: String,
     delivery_target: String,
-    active_start_hour: Option<u8>,
-    active_end_hour: Option<u8>,
     #[serde(default = "default_enabled")]
     enabled: bool,
+}
+
+fn default_schedule() -> String {
+    "0 * * * *".to_string()
 }
 
 fn default_enabled() -> bool {
@@ -1516,12 +1518,8 @@ impl Config {
                     .map(|h| CronDef {
                         id: h.id,
                         prompt: h.prompt,
-                        interval_secs: h.interval_secs.unwrap_or(3600),
+                        schedule: h.schedule,
                         delivery_target: h.delivery_target,
-                        active_hours: match (h.active_start_hour, h.active_end_hour) {
-                            (Some(s), Some(e)) => Some((s, e)),
-                            _ => None,
-                        },
                         enabled: h.enabled,
                     })
                     .collect();

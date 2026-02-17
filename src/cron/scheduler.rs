@@ -1,29 +1,29 @@
-//! Cron scheduler: timer management and execution.
+//! Cron scheduler: cron-expression-based job scheduling and execution.
 //!
-//! Each cron job gets its own tokio task that fires on an interval.
-//! When a job fires, it creates a fresh short-lived channel,
-//! runs the job's prompt through the LLM, and delivers the result
-//! to the delivery target via the messaging system.
+//! Each cron job gets its own tokio task that sleeps until the next
+//! scheduled time, fires, then computes the next occurrence. When a job
+//! fires, it creates a fresh short-lived channel, runs the job's prompt
+//! through the LLM, and delivers the result to the delivery target via
+//! the messaging system.
 
 use crate::agent::channel::Channel;
 use crate::cron::store::CronStore;
 use crate::error::Result;
 use crate::messaging::MessagingManager;
 use crate::{AgentDeps, InboundMessage, MessageContent, OutboundResponse};
-use chrono::Timelike;
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tokio::time::{interval, Duration};
+use tokio::time::Duration;
 
 /// A cron job definition loaded from the database.
 #[derive(Debug, Clone)]
 pub struct CronJob {
     pub id: String,
     pub prompt: String,
-    pub interval_secs: u64,
+    pub schedule: String,
     pub delivery_target: DeliveryTarget,
-    pub active_hours: Option<(u8, u8)>,
     pub enabled: bool,
     pub consecutive_failures: u32,
 }
@@ -31,9 +31,9 @@ pub struct CronJob {
 /// Where to send cron job results.
 #[derive(Debug, Clone)]
 pub struct DeliveryTarget {
-    /// Messaging adapter name (e.g. "discord").
+    /// Messaging adapter name (e.g. "telegram").
     pub adapter: String,
-    /// Platform-specific target (e.g. a Discord channel ID).
+    /// Platform-specific target (e.g. a chat ID).
     pub target: String,
 }
 
@@ -62,17 +62,16 @@ impl std::fmt::Display for DeliveryTarget {
 pub struct CronConfig {
     pub id: String,
     pub prompt: String,
-    #[serde(default = "default_interval")]
-    pub interval_secs: u64,
-    /// Delivery target in "adapter:target" format (e.g. "discord:123456789").
+    #[serde(default = "default_schedule")]
+    pub schedule: String,
+    /// Delivery target in "adapter:target" format (e.g. "telegram:525365593").
     pub delivery_target: String,
-    pub active_hours: Option<(u8, u8)>,
     #[serde(default = "default_true")]
     pub enabled: bool,
 }
 
-fn default_interval() -> u64 {
-    3600
+fn default_schedule() -> String {
+    "0 * * * *".to_string()
 }
 
 fn default_true() -> bool {
@@ -134,9 +133,8 @@ impl Scheduler {
         let job = CronJob {
             id: config.id.clone(),
             prompt: config.prompt,
-            interval_secs: config.interval_secs,
+            schedule: config.schedule.clone(),
             delivery_target,
-            active_hours: config.active_hours,
             enabled: config.enabled,
             consecutive_failures: 0,
         };
@@ -150,7 +148,7 @@ impl Scheduler {
             self.start_timer(&config.id).await;
         }
 
-        tracing::info!(cron_id = %config.id, interval_secs = config.interval_secs, "cron job registered");
+        tracing::info!(cron_id = %config.id, schedule = %config.schedule, "cron job registered");
         Ok(())
     }
 
@@ -162,29 +160,16 @@ impl Scheduler {
         let context = self.context.clone();
 
         let handle = tokio::spawn(async move {
-            // Look up interval before entering the loop
-            let interval_secs = {
-                let j = jobs.read().await;
-                j.get(&job_id)
-                    .map(|j| j.interval_secs)
-                    .unwrap_or(3600)
-            };
-
-            let mut ticker = interval(Duration::from_secs(interval_secs));
-            // Skip the immediate first tick — jobs should wait for the first interval
-            ticker.tick().await;
-
             loop {
-                ticker.tick().await;
-
-                let job = {
+                // Read the schedule expression from the current job state.
+                let (schedule_expr, job_enabled) = {
                     let j = jobs.read().await;
                     match j.get(&job_id) {
                         Some(j) if !j.enabled => {
                             tracing::debug!(cron_id = %job_id, "cron job disabled, stopping timer");
                             break;
                         }
-                        Some(j) => j.clone(),
+                        Some(j) => (j.schedule.clone(), j.enabled),
                         None => {
                             tracing::debug!(cron_id = %job_id, "cron job removed, stopping timer");
                             break;
@@ -192,26 +177,62 @@ impl Scheduler {
                     }
                 };
 
-                // Check active hours window
-                if let Some((start, end)) = job.active_hours {
-                    let current_hour = chrono::Local::now().hour() as u8;
-                    let in_window = if start <= end {
-                        current_hour >= start && current_hour < end
-                    } else {
-                        // Wraps midnight (e.g. 22:00 - 06:00)
-                        current_hour >= start || current_hour < end
-                    };
-                    if !in_window {
-                        tracing::debug!(
-                            cron_id = %job_id,
-                            current_hour,
-                            start,
-                            end,
-                            "outside active hours, skipping"
-                        );
-                        continue;
-                    }
+                if !job_enabled {
+                    break;
                 }
+
+                // Parse the cron expression and find next occurrence.
+                let cron = match croner::Cron::from_str(&schedule_expr) {
+                    Ok(cron) => cron,
+                    Err(error) => {
+                        tracing::error!(
+                            cron_id = %job_id,
+                            schedule = %schedule_expr,
+                            %error,
+                            "invalid cron expression, stopping timer"
+                        );
+                        break;
+                    }
+                };
+
+                let now = chrono::Local::now();
+                let next = match cron.find_next_occurrence(&now, false) {
+                    Ok(next) => next,
+                    Err(error) => {
+                        tracing::error!(
+                            cron_id = %job_id,
+                            %error,
+                            "failed to compute next cron occurrence, stopping timer"
+                        );
+                        break;
+                    }
+                };
+
+                let duration_until = (next - now).to_std().unwrap_or(Duration::from_secs(60));
+                tracing::debug!(
+                    cron_id = %job_id,
+                    next_fire = %next.format("%Y-%m-%d %H:%M:%S %Z"),
+                    secs_until = duration_until.as_secs(),
+                    "sleeping until next cron occurrence"
+                );
+
+                tokio::time::sleep(duration_until).await;
+
+                // Re-read job state after sleeping (it may have been disabled or removed).
+                let job = {
+                    let j = jobs.read().await;
+                    match j.get(&job_id) {
+                        Some(j) if !j.enabled => {
+                            tracing::debug!(cron_id = %job_id, "cron job disabled during sleep, stopping timer");
+                            break;
+                        }
+                        Some(j) => j.clone(),
+                        None => {
+                            tracing::debug!(cron_id = %job_id, "cron job removed during sleep, stopping timer");
+                            break;
+                        }
+                    }
+                };
 
                 tracing::info!(cron_id = %job_id, "cron job firing");
 
@@ -359,7 +380,6 @@ impl Scheduler {
         }
 
         // If disabling, the timer loop will detect this and stop naturally
-        // (see the check at line 183 in start_timer)
         if !enabled && was_enabled {
             tracing::info!(cron_id = %job_id, "cron job disabled, timer will stop on next tick");
         }

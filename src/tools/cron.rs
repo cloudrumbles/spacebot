@@ -6,6 +6,7 @@ use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::str::FromStr;
 use std::sync::Arc;
 
 /// Tool for managing cron jobs (scheduled recurring tasks).
@@ -35,18 +36,12 @@ pub struct CronArgs {
     /// Required for "create": the prompt/instruction to execute on each run.
     #[serde(default)]
     pub prompt: Option<String>,
-    /// Required for "create": interval in seconds between runs.
+    /// Required for "create": a cron expression defining the schedule (e.g. "0 9 * * *" for daily at 9am).
     #[serde(default)]
-    pub interval_secs: Option<u64>,
-    /// Required for "create": where to deliver results, in "adapter:target" format (e.g. "discord:123456789").
+    pub schedule: Option<String>,
+    /// Required for "create": where to deliver results, in "adapter:target" format (e.g. "telegram:525365593").
     #[serde(default)]
     pub delivery_target: Option<String>,
-    /// Optional for "create": hour (0-23) when the job becomes active.
-    #[serde(default)]
-    pub active_start_hour: Option<u8>,
-    /// Optional for "create": hour (0-23) when the job becomes inactive.
-    #[serde(default)]
-    pub active_end_hour: Option<u8>,
     /// Required for "delete": the ID of the cron job to remove.
     #[serde(default)]
     pub delete_id: Option<String>,
@@ -65,9 +60,8 @@ pub struct CronOutput {
 pub struct CronEntry {
     pub id: String,
     pub prompt: String,
-    pub interval_secs: u64,
+    pub schedule: String,
     pub delivery_target: String,
-    pub active_hours: Option<String>,
 }
 
 impl Tool for CronTool {
@@ -97,21 +91,13 @@ impl Tool for CronTool {
                         "type": "string",
                         "description": "For 'create': the instruction to execute on each run."
                     },
-                    "interval_secs": {
-                        "type": "integer",
-                        "description": "For 'create': seconds between runs (e.g. 3600 = hourly, 86400 = daily)."
+                    "schedule": {
+                        "type": "string",
+                        "description": "For 'create': a cron expression (e.g. '0 9 * * *' for daily at 9am, '*/5 * * * *' for every 5 minutes). Format: minute hour day-of-month month day-of-week."
                     },
                     "delivery_target": {
                         "type": "string",
-                        "description": "For 'create': where to send results, format 'adapter:target' (e.g. 'discord:123456789')."
-                    },
-                    "active_start_hour": {
-                        "type": "integer",
-                        "description": "For 'create': optional start of active window (0-23, 24h format)."
-                    },
-                    "active_end_hour": {
-                        "type": "integer",
-                        "description": "For 'create': optional end of active window (0-23, 24h format)."
+                        "description": "For 'create': where to send results, format 'adapter:target' (e.g. 'telegram:525365593')."
                     },
                     "delete_id": {
                         "type": "string",
@@ -143,24 +129,22 @@ impl CronTool {
         let prompt = args
             .prompt
             .ok_or_else(|| CronError("'prompt' is required for create".into()))?;
-        let interval_secs = args
-            .interval_secs
-            .ok_or_else(|| CronError("'interval_secs' is required for create".into()))?;
+        let schedule = args
+            .schedule
+            .ok_or_else(|| CronError("'schedule' is required for create".into()))?;
         let delivery_target = args
             .delivery_target
             .ok_or_else(|| CronError("'delivery_target' is required for create".into()))?;
 
-        let active_hours = match (args.active_start_hour, args.active_end_hour) {
-            (Some(start), Some(end)) => Some((start, end)),
-            _ => None,
-        };
+        // Validate the cron expression
+        let cron = croner::Cron::from_str(&schedule)
+            .map_err(|e| CronError(format!("invalid cron expression '{schedule}': {e}")))?;
 
         let config = CronConfig {
             id: id.clone(),
             prompt: prompt.clone(),
-            interval_secs,
+            schedule: schedule.clone(),
             delivery_target: delivery_target.clone(),
-            active_hours,
             enabled: true,
         };
 
@@ -176,13 +160,11 @@ impl CronTool {
             .await
             .map_err(|error| CronError(format!("failed to register: {error}")))?;
 
-        let interval_desc = format_interval(interval_secs);
-        let mut message = format!("Cron job '{id}' created. Runs {interval_desc}.");
-        if let Some((start, end)) = active_hours {
-            message.push_str(&format!(" Active {start:02}:00-{end:02}:00."));
-        }
+        // Generate a human-readable description of the schedule
+        let description = cron.describe();
+        let message = format!("Cron job '{id}' created. Schedule: {schedule} ({description}).");
 
-        tracing::info!(cron_id = %id, %interval_secs, %delivery_target, "cron job created via tool");
+        tracing::info!(cron_id = %id, %schedule, %delivery_target, "cron job created via tool");
 
         Ok(CronOutput {
             success: true,
@@ -203,9 +185,8 @@ impl CronTool {
             .map(|config| CronEntry {
                 id: config.id,
                 prompt: config.prompt,
-                interval_secs: config.interval_secs,
+                schedule: config.schedule,
                 delivery_target: config.delivery_target,
-                active_hours: config.active_hours.map(|(s, e)| format!("{s:02}:00-{e:02}:00")),
             })
             .collect();
 
@@ -223,6 +204,9 @@ impl CronTool {
             .or(args.id)
             .ok_or_else(|| CronError("'delete_id' or 'id' is required for delete".into()))?;
 
+        // Unregister from the running scheduler first
+        self.scheduler.unregister(&id).await;
+
         self.store
             .delete(&id)
             .await
@@ -235,32 +219,5 @@ impl CronTool {
             message: format!("Cron job '{id}' deleted."),
             jobs: None,
         })
-    }
-}
-
-fn format_interval(secs: u64) -> String {
-    if secs % 86400 == 0 {
-        let days = secs / 86400;
-        if days == 1 {
-            "every day".into()
-        } else {
-            format!("every {days} days")
-        }
-    } else if secs % 3600 == 0 {
-        let hours = secs / 3600;
-        if hours == 1 {
-            "every hour".into()
-        } else {
-            format!("every {hours} hours")
-        }
-    } else if secs % 60 == 0 {
-        let minutes = secs / 60;
-        if minutes == 1 {
-            "every minute".into()
-        } else {
-            format!("every {minutes} minutes")
-        }
-    } else {
-        format!("every {secs} seconds")
     }
 }

@@ -41,7 +41,7 @@ pub mod channel_recall;
 pub mod cron;
 pub mod send_file;
 
-pub use reply::{ReplyTool, ReplyArgs, ReplyOutput, ReplyError};
+pub use reply::{ReplyTool, ReplyArgs, ReplyOutput, ReplyError, RepliedFlag, new_replied_flag};
 pub use branch_tool::{BranchTool, BranchArgs, BranchOutput, BranchError};
 pub use spawn_worker::{SpawnWorkerTool, SpawnWorkerArgs, SpawnWorkerOutput, SpawnWorkerError};
 pub use route::{RouteTool, RouteArgs, RouteOutput, RouteError};
@@ -114,6 +114,7 @@ pub async fn add_channel_tools(
     response_tx: mpsc::Sender<OutboundResponse>,
     conversation_id: impl Into<String>,
     skip_flag: SkipFlag,
+    replied_flag: RepliedFlag,
     cron_tool: Option<CronTool>,
 ) -> Result<(), rig::tool::server::ToolServerError> {
     handle.add_tool(ReplyTool::new(
@@ -121,7 +122,7 @@ pub async fn add_channel_tools(
         conversation_id,
         state.conversation_logger.clone(),
         state.channel_id.clone(),
-        skip_flag.clone(),
+        replied_flag,
     )).await?;
     handle.add_tool(BranchTool::new(state.clone())).await?;
     handle.add_tool(SpawnWorkerTool::new(state.clone())).await?;

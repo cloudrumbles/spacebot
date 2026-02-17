@@ -1211,9 +1211,8 @@ async fn initialize_agents(
             let cron_config = spacebot::cron::CronConfig {
                 id: cron_def.id.clone(),
                 prompt: cron_def.prompt.clone(),
-                interval_secs: cron_def.interval_secs,
+                schedule: cron_def.schedule.clone(),
                 delivery_target: cron_def.delivery_target.clone(),
-                active_hours: cron_def.active_hours,
                 enabled: cron_def.enabled,
             };
             if let Err(error) = store.save(&cron_config).await {

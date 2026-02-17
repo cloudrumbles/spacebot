@@ -2,13 +2,24 @@
 
 use crate::conversation::ConversationLogger;
 use crate::{ChannelId, OutboundResponse};
-use crate::tools::SkipFlag;
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::mpsc;
+
+/// Shared flag between the ReplyTool and the channel event loop.
+///
+/// When the tool is called, this is set to `true`. The channel checks it
+/// after the LLM turn to suppress duplicate fallback text output.
+pub type RepliedFlag = Arc<AtomicBool>;
+
+/// Create a new replied flag (defaults to false).
+pub fn new_replied_flag() -> RepliedFlag {
+    Arc::new(AtomicBool::new(false))
+}
 
 /// Tool for replying to users.
 ///
@@ -22,7 +33,7 @@ pub struct ReplyTool {
     conversation_id: String,
     conversation_logger: ConversationLogger,
     channel_id: ChannelId,
-    skip_flag: SkipFlag,
+    replied_flag: RepliedFlag,
 }
 
 impl ReplyTool {
@@ -32,14 +43,14 @@ impl ReplyTool {
         conversation_id: impl Into<String>,
         conversation_logger: ConversationLogger,
         channel_id: ChannelId,
-        skip_flag: SkipFlag,
+        replied_flag: RepliedFlag,
     ) -> Self {
         Self {
             response_tx,
             conversation_id: conversation_id.into(),
             conversation_logger,
             channel_id,
-            skip_flag,
+            replied_flag,
         }
     }
 }
@@ -98,6 +109,8 @@ impl Tool for ReplyTool {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        self.replied_flag.store(true, Ordering::Relaxed);
+
         tracing::info!(
             conversation_id = %self.conversation_id,
             content_len = args.content.len(),
@@ -127,9 +140,6 @@ impl Tool for ReplyTool {
             .send(response)
             .await
             .map_err(|e| ReplyError(format!("failed to send reply: {e}")))?;
-
-        // Mark the turn as handled so handle_agent_result skips the fallback send.
-        self.skip_flag.store(true, Ordering::Relaxed);
 
         tracing::debug!(conversation_id = %self.conversation_id, "reply sent to outbound channel");
 
