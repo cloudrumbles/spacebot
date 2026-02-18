@@ -40,6 +40,7 @@ pub mod web_search;
 pub mod channel_recall;
 pub mod cron;
 pub mod send_file;
+pub mod dynamic;
 
 pub use reply::{ReplyTool, ReplyArgs, ReplyOutput, ReplyError, RepliedFlag, new_replied_flag};
 pub use branch_tool::{BranchTool, BranchArgs, BranchOutput, BranchError};
@@ -60,6 +61,7 @@ pub use web_search::{WebSearchTool, WebSearchArgs, WebSearchOutput, WebSearchErr
 pub use channel_recall::{ChannelRecallTool, ChannelRecallArgs, ChannelRecallOutput, ChannelRecallError};
 pub use cron::{CronTool, CronArgs, CronOutput, CronError};
 pub use send_file::{SendFileTool, SendFileArgs, SendFileOutput, SendFileError};
+pub use dynamic::{ToolSearchTool, ToolExecuteTool};
 
 use crate::agent::channel::ChannelState;
 use crate::config::BrowserConfig;
@@ -116,6 +118,7 @@ pub async fn add_channel_tools(
     skip_flag: SkipFlag,
     replied_flag: RepliedFlag,
     cron_tool: Option<CronTool>,
+    tool_search: Option<ToolSearchTool>,
 ) -> Result<(), rig::tool::server::ToolServerError> {
     handle.add_tool(ReplyTool::new(
         response_tx.clone(),
@@ -133,6 +136,9 @@ pub async fn add_channel_tools(
     handle.add_tool(ReactTool::new(response_tx)).await?;
     if let Some(cron) = cron_tool {
         handle.add_tool(cron).await?;
+    }
+    if let Some(ts) = tool_search {
+        handle.add_tool(ts).await?;
     }
     Ok(())
 }
@@ -154,6 +160,8 @@ pub async fn remove_channel_tools(
     handle.remove_tool(ReactTool::NAME).await?;
     // Cron tool removal is best-effort since not all channels have it
     let _ = handle.remove_tool(CronTool::NAME).await;
+    // tool_search removal is best-effort
+    let _ = handle.remove_tool(ToolSearchTool::NAME).await;
     Ok(())
 }
 
@@ -197,8 +205,10 @@ pub fn create_worker_tool_server(
     let mut server = ToolServer::new()
         .tool(ShellTool::new(instance_dir.clone(), workspace.clone()))
         .tool(FileTool::new(workspace.clone()))
-        .tool(ExecTool::new(instance_dir, workspace))
-        .tool(SetStatusTool::new(agent_id, worker_id, channel_id, event_tx));
+        .tool(ExecTool::new(instance_dir.clone(), workspace.clone()))
+        .tool(SetStatusTool::new(agent_id, worker_id, channel_id, event_tx))
+        .tool(ToolSearchTool::new(workspace.clone(), instance_dir.clone()))
+        .tool(ToolExecuteTool::new(workspace, instance_dir));
 
     if browser_config.enabled {
         server = server.tool(BrowserTool::new(browser_config, screenshot_dir));
@@ -243,7 +253,9 @@ pub fn create_cortex_chat_tool_server(
         .tool(ChannelRecallTool::new(conversation_logger, channel_store))
         .tool(ShellTool::new(instance_dir.clone(), workspace.clone()))
         .tool(FileTool::new(workspace.clone()))
-        .tool(ExecTool::new(instance_dir, workspace));
+        .tool(ExecTool::new(instance_dir.clone(), workspace.clone()))
+        .tool(ToolSearchTool::new(workspace.clone(), instance_dir.clone()))
+        .tool(ToolExecuteTool::new(workspace, instance_dir));
 
     if browser_config.enabled {
         server = server.tool(BrowserTool::new(browser_config, screenshot_dir));

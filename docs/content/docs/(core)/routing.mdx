@@ -38,18 +38,7 @@ cortex = "anthropic/claude-haiku-4.5-20250514"
 
 ### Level 2: Task-Type Overrides
 
-Workers and branches are generic. Different tasks benefit from different models. The channel or branch specifies a task type when spawning, and the routing config maps task types to models.
-
-```toml
-[defaults.routing.task_overrides]
-coding = "anthropic/claude-sonnet-4-20250514"
-summarization = "anthropic/claude-haiku-4.5-20250514"
-deep_reasoning = "anthropic/claude-opus-4-20250514"
-```
-
-Task types are explicit strings passed at spawn time. The set is open — operators can define their own and map them to models. Unknown task types fall back to the process-type default.
-
-Task overrides apply to workers and branches. Other process types ignore task_type.
+Task-type overrides are defined in config but are not currently used at runtime — all workers and branches are spawned without a task type, so they always use the process-type default. The infrastructure exists and will be wired up in a future release.
 
 ### Level 3: Fallback Chains
 

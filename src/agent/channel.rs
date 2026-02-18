@@ -678,6 +678,12 @@ impl Channel {
         let skip_flag = crate::tools::new_skip_flag();
         let replied_flag = crate::tools::new_replied_flag();
 
+        let rc = &self.deps.runtime_config;
+        let tool_search = Some(crate::tools::ToolSearchTool::new(
+            rc.workspace_dir.clone(),
+            rc.instance_dir.clone(),
+        ));
+
         if let Err(error) = crate::tools::add_channel_tools(
             &self.tool_server,
             self.state.clone(),
@@ -686,6 +692,7 @@ impl Channel {
             skip_flag.clone(),
             replied_flag.clone(),
             self.deps.cron_tool.clone(),
+            tool_search,
         ).await {
             tracing::error!(%error, "failed to add channel tools");
             return Err(AgentError::Other(error.into()).into());
@@ -1080,6 +1087,7 @@ pub async fn spawn_worker_from_state(
     task: impl Into<String>,
     interactive: bool,
     skill_name: Option<&str>,
+    task_type: Option<&str>,
 ) -> std::result::Result<WorkerId, AgentError> {
     check_worker_limit(state).await?;
     let task = task.into();
@@ -1118,6 +1126,7 @@ pub async fn spawn_worker_from_state(
             state.screenshot_dir.clone(),
             brave_search_key.clone(),
             state.logs_dir.clone(),
+            task_type.map(str::to_owned),
         );
         let worker_id = worker.id;
         state.worker_inputs.write().await.insert(worker_id, input_tx);
@@ -1132,6 +1141,7 @@ pub async fn spawn_worker_from_state(
             state.screenshot_dir.clone(),
             brave_search_key,
             state.logs_dir.clone(),
+            task_type.map(str::to_owned),
         )
     };
     
@@ -1174,6 +1184,7 @@ pub async fn spawn_opencode_worker_from_state(
     task: impl Into<String>,
     directory: &str,
     interactive: bool,
+    task_type: Option<&str>,
 ) -> std::result::Result<crate::WorkerId, AgentError> {
     check_worker_limit(state).await?;
     let task = task.into();
@@ -1190,6 +1201,9 @@ pub async fn spawn_opencode_worker_from_state(
 
     let server_pool = rc.opencode_server_pool.clone();
 
+    let routing = rc.routing.load();
+    let model_name = routing.resolve(crate::ProcessType::Worker, task_type).to_string();
+
     let worker = if interactive {
         let (worker, input_tx) = crate::opencode::OpenCodeWorker::new_interactive(
             Some(state.channel_id.clone()),
@@ -1201,7 +1215,7 @@ pub async fn spawn_opencode_worker_from_state(
         );
         let worker_id = worker.id;
         state.worker_inputs.write().await.insert(worker_id, input_tx);
-        worker
+        worker.with_model(model_name)
     } else {
         crate::opencode::OpenCodeWorker::new(
             Some(state.channel_id.clone()),
@@ -1210,7 +1224,7 @@ pub async fn spawn_opencode_worker_from_state(
             directory,
             server_pool,
             state.deps.event_tx.clone(),
-        )
+        ).with_model(model_name)
     };
 
     let worker_id = worker.id;

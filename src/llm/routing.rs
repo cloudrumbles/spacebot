@@ -3,6 +3,10 @@
 use crate::ProcessType;
 use std::collections::HashMap;
 
+/// Task types that must be explicitly declared in [defaults.routing.task_overrides].
+/// Set the value to "none" to fall through to the process-type default.
+pub const REQUIRED_TASK_TYPES: &[&str] = &["coding", "summarization", "deep_reasoning"];
+
 /// Model routing configuration. Lives on the agent config (via defaults).
 /// Determines which LLM model each process type uses, with task-type
 /// overrides for workers/branches and fallback chains for resilience.
@@ -56,7 +60,9 @@ impl RoutingConfig {
         if let Some(task) = task_type {
             if matches!(process_type, ProcessType::Worker | ProcessType::Branch) {
                 if let Some(override_model) = self.task_overrides.get(task) {
-                    return override_model;
+                    if override_model != "none" {
+                        return override_model;
+                    }
                 }
             }
         }

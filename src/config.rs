@@ -1327,6 +1327,50 @@ impl Config {
         // Note: We allow boot without provider keys now. System starts in setup mode.
         // Agents are initialized later when keys are added via API.
 
+        // Require all routing models to be explicitly set in config.toml.
+        {
+            let r = toml.defaults.routing.as_ref();
+            let missing: Vec<&str> = [
+                ("channel", r.and_then(|r| r.channel.as_ref())),
+                ("branch",  r.and_then(|r| r.branch.as_ref())),
+                ("worker",  r.and_then(|r| r.worker.as_ref())),
+                ("compactor", r.and_then(|r| r.compactor.as_ref())),
+                ("cortex",  r.and_then(|r| r.cortex.as_ref())),
+            ]
+            .into_iter()
+            .filter_map(|(name, val)| if val.is_none() { Some(name) } else { None })
+            .collect();
+
+            if !missing.is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "missing required routing fields in [defaults.routing]: {}. \
+                     All model fields must be explicitly set in config.toml.",
+                    missing.join(", ")
+                )).into());
+            }
+
+            // Require all known task types to be declared in [defaults.routing.task_overrides].
+            // Set to "none" to use the process-type default for that task.
+            let task_overrides = r.map(|r| &r.task_overrides);
+            let missing_tasks: Vec<&str> = crate::llm::routing::REQUIRED_TASK_TYPES
+                .iter()
+                .filter(|&&t| {
+                    task_overrides
+                        .map(|ov| !ov.contains_key(t))
+                        .unwrap_or(true)
+                })
+                .copied()
+                .collect();
+
+            if !missing_tasks.is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "missing required task types in [defaults.routing.task_overrides]: {}. \
+                     Set to \"none\" to use the process-type default for that task.",
+                    missing_tasks.join(", ")
+                )).into());
+            }
+        }
+
         let base_defaults = DefaultsConfig::default();
         let defaults = DefaultsConfig {
             routing: resolve_routing(toml.defaults.routing, &base_defaults.routing),

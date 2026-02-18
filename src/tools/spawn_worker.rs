@@ -37,6 +37,11 @@ pub struct SpawnWorkerArgs {
     /// receive the full skill instructions in its system prompt.
     #[serde(default)]
     pub skill: Option<String>,
+    /// Task type for model routing. One of: "coding", "summarization", "deep_reasoning".
+    /// Determines which model is used if task_overrides are configured. Omit to use
+    /// the default worker model.
+    #[serde(default)]
+    pub task_type: Option<String>,
     /// Worker type: "builtin" (default) runs a Rig agent loop with shell/file/exec
     /// tools. "opencode" spawns an OpenCode subprocess with full coding agent
     /// capabilities. Use "opencode" for complex coding tasks that benefit from
@@ -107,6 +112,11 @@ impl Tool for SpawnWorkerTool {
             "skill": {
                 "type": "string",
                 "description": "Name of a skill to load into the worker. The worker receives the full skill instructions in its system prompt. Only use skill names from <available_skills>."
+            },
+            "task_type": {
+                "type": "string",
+                "enum": ["coding", "summarization", "deep_reasoning"],
+                "description": "Hint for model routing. \"coding\" for software development tasks, \"summarization\" for condensing/compacting content, \"deep_reasoning\" for complex analysis. Omit to use the default worker model."
             }
         });
 
@@ -152,6 +162,7 @@ impl Tool for SpawnWorkerTool {
                 &args.task,
                 directory,
                 args.interactive,
+                args.task_type.as_deref(),
             )
             .await
             .map_err(|e| SpawnWorkerError(format!("{e}")))?
@@ -161,6 +172,7 @@ impl Tool for SpawnWorkerTool {
                 &args.task,
                 args.interactive,
                 args.skill.as_deref(),
+                args.task_type.as_deref(),
             )
             .await
             .map_err(|e| SpawnWorkerError(format!("{e}")))?

@@ -311,13 +311,23 @@ impl SpacebotModel {
             body["tools"] = serde_json::json!(tools);
         }
 
-        let response = self
+        let is_oauth = api_key.starts_with("sk-ant-oat");
+        let mut req = self
             .llm_manager
             .http_client()
             .post("https://api.anthropic.com/v1/messages")
-            .header("x-api-key", &api_key)
             .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json")
+            .header("content-type", "application/json");
+
+        if is_oauth {
+            req = req
+                .header("authorization", format!("Bearer {api_key}"))
+                .header("anthropic-beta", "oauth-2025-04-20");
+        } else {
+            req = req.header("x-api-key", &api_key);
+        }
+
+        let response = req
             .json(&body)
             .send()
             .await

@@ -43,10 +43,6 @@ compactor = "anthropic/claude-haiku-4.5-20250514"
 cortex = "anthropic/claude-haiku-4.5-20250514"
 rate_limit_cooldown_secs = 60
 
-# Task-type overrides for workers/branches.
-[defaults.routing.task_overrides]
-coding = "anthropic/claude-sonnet-4-20250514"
-
 # Fallback chains when a model is rate-limited or down.
 [defaults.routing.fallbacks]
 "anthropic/claude-sonnet-4-20250514" = ["anthropic/claude-haiku-4.5-20250514"]
@@ -287,13 +283,7 @@ At least one key must be provided (via config or environment).
 
 ### `[defaults.routing.task_overrides]`
 
-Map of task type names to model names. Applied when workers or branches are spawned with a specific task type.
-
-```toml
-[defaults.routing.task_overrides]
-coding = "anthropic/claude-sonnet-4-20250514"
-deep_reasoning = "anthropic/claude-opus-4-20250514"
-```
+Not currently in use — task types are not passed at spawn time. This section is reserved for a future release.
 
 ### `[defaults.routing.fallbacks]`
 

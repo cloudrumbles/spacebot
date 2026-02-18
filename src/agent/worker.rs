@@ -54,6 +54,8 @@ pub struct Worker {
     pub brave_search_key: Option<String>,
     /// Directory for writing execution logs on failure.
     pub logs_dir: PathBuf,
+    /// Task type for model routing (e.g. "coding", "summarization", "deep_reasoning").
+    pub task_type: Option<String>,
     /// Status updates.
     pub status_tx: watch::Sender<String>,
     pub status_rx: watch::Receiver<String>,
@@ -70,12 +72,13 @@ impl Worker {
         screenshot_dir: PathBuf,
         brave_search_key: Option<String>,
         logs_dir: PathBuf,
+        task_type: Option<String>,
     ) -> Self {
         let id = Uuid::new_v4();
         let process_id = ProcessId::Worker(id);
         let hook = SpacebotHook::new(deps.agent_id.clone(), process_id, ProcessType::Worker, channel_id.clone(), deps.event_tx.clone());
         let (status_tx, status_rx) = watch::channel("starting".to_string());
-        
+
         Self {
             id,
             channel_id,
@@ -89,11 +92,12 @@ impl Worker {
             screenshot_dir,
             brave_search_key,
             logs_dir,
+            task_type,
             status_tx,
             status_rx,
         }
     }
-    
+
     /// Create a new interactive worker.
     pub fn new_interactive(
         channel_id: Option<ChannelId>,
@@ -104,13 +108,14 @@ impl Worker {
         screenshot_dir: PathBuf,
         brave_search_key: Option<String>,
         logs_dir: PathBuf,
+        task_type: Option<String>,
     ) -> (Self, mpsc::Sender<String>) {
         let id = Uuid::new_v4();
         let process_id = ProcessId::Worker(id);
         let hook = SpacebotHook::new(deps.agent_id.clone(), process_id, ProcessType::Worker, channel_id.clone(), deps.event_tx.clone());
         let (status_tx, status_rx) = watch::channel("starting".to_string());
         let (input_tx, input_rx) = mpsc::channel(32);
-        
+
         let worker = Self {
             id,
             channel_id,
@@ -124,10 +129,11 @@ impl Worker {
             screenshot_dir,
             brave_search_key,
             logs_dir,
+            task_type,
             status_tx,
             status_rx,
         };
-        
+
         (worker, input_tx)
     }
     
@@ -183,7 +189,7 @@ impl Worker {
         );
 
         let routing = self.deps.runtime_config.routing.load();
-        let model_name = routing.resolve(ProcessType::Worker, None).to_string();
+        let model_name = routing.resolve(ProcessType::Worker, self.task_type.as_deref()).to_string();
         let model = SpacebotModel::make(&self.deps.llm_manager, &model_name)
             .with_routing((**routing).clone());
 
