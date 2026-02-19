@@ -717,10 +717,7 @@ impl Channel {
         let replied_flag = crate::tools::new_replied_flag();
 
         let rc = &self.deps.runtime_config;
-        let tool_search = Some(crate::tools::ToolSearchTool::new(
-            rc.workspace_dir.clone(),
-            rc.instance_dir.clone(),
-        ));
+        let tool_search = Some(crate::tools::ToolSearchTool::new(rc.workspace_dir.clone()));
 
         if let Err(error) = crate::tools::add_channel_tools(
             &self.tool_server,

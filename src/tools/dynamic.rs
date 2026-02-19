@@ -1,7 +1,8 @@
 //! Dynamic script-based tools that can be created, discovered, and executed at runtime.
 //!
-//! Tools are stored as directories containing a `tool.json` manifest and an executable
-//! script (e.g. `run.py`, `run.sh`). The bot can create new tools by writing these files
+//! Tools are stored as directories under the agent workspace at `workspace/tools/`,
+//! each containing a `tool.json` manifest and an executable script
+//! (e.g. `run.py`, `run.sh`). The bot can create new tools by writing these files
 //! to disk, then search for and execute them without recompiling.
 //!
 //! Two meta-tools provide access:
@@ -87,57 +88,14 @@ fn scan_tools_dir(dir: &Path) -> HashMap<String, (ToolManifest, PathBuf)> {
     tools
 }
 
-/// Scan both instance and workspace tool directories. Workspace wins on name conflict.
-fn scan_all_tools(workspace: &Path, instance_dir: &Path) -> HashMap<String, (ToolManifest, PathBuf)> {
-    let instance_tools_dir = instance_dir.join("tools");
-    let workspace_tools_dir = workspace.join("tools");
-
-    let mut tools = scan_tools_dir(&instance_tools_dir);
-
-    // Workspace tools override instance tools
-    for (name, entry) in scan_tools_dir(&workspace_tools_dir) {
-        tools.insert(name, entry);
-    }
-
-    tools
+/// Scan the agent workspace tools directory (`workspace/tools`) for dynamic tools.
+fn scan_all_tools(workspace: &Path) -> HashMap<String, (ToolManifest, PathBuf)> {
+    scan_tools_dir(&workspace.join("tools"))
 }
 
-/// Find the tool directory for a given tool name (workspace-first lookup).
-fn find_tool_dir(name: &str, workspace: &Path, instance_dir: &Path) -> Option<(ToolManifest, PathBuf)> {
-    let workspace_tools_dir = workspace.join("tools");
-    let instance_tools_dir = instance_dir.join("tools");
-
-    // Check workspace first
-    for dir in [&workspace_tools_dir, &instance_tools_dir] {
-        let entries = match std::fs::read_dir(dir) {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_dir() {
-                continue;
-            }
-
-            let manifest_path = path.join("tool.json");
-            let content = match std::fs::read_to_string(&manifest_path) {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-
-            let manifest: ToolManifest = match serde_json::from_str(&content) {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-
-            if manifest.name == name {
-                return Some((manifest, path));
-            }
-        }
-    }
-
-    None
+/// Find the tool directory for a given tool name in `workspace/tools`.
+fn find_tool_dir(name: &str, workspace: &Path) -> Option<(ToolManifest, PathBuf)> {
+    scan_all_tools(workspace).remove(name)
 }
 
 /// Find the runner script in a tool directory.
@@ -186,12 +144,11 @@ fn find_runner(tool_dir: &Path) -> Option<(Option<String>, PathBuf)> {
 #[derive(Debug, Clone)]
 pub struct ToolSearchTool {
     workspace: PathBuf,
-    instance_dir: PathBuf,
 }
 
 impl ToolSearchTool {
-    pub fn new(workspace: PathBuf, instance_dir: PathBuf) -> Self {
-        Self { workspace, instance_dir }
+    pub fn new(workspace: PathBuf) -> Self {
+        Self { workspace }
     }
 }
 
@@ -247,7 +204,7 @@ impl Tool for ToolSearchTool {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        let all_tools = scan_all_tools(&self.workspace, &self.instance_dir);
+        let all_tools = scan_all_tools(&self.workspace);
         let query = args.query.to_lowercase();
 
         let mut results: Vec<ToolInfo> = all_tools
@@ -284,12 +241,11 @@ impl Tool for ToolSearchTool {
 #[derive(Debug, Clone)]
 pub struct ToolExecuteTool {
     workspace: PathBuf,
-    instance_dir: PathBuf,
 }
 
 impl ToolExecuteTool {
-    pub fn new(workspace: PathBuf, instance_dir: PathBuf) -> Self {
-        Self { workspace, instance_dir }
+    pub fn new(workspace: PathBuf) -> Self {
+        Self { workspace }
     }
 }
 
@@ -361,7 +317,7 @@ impl Tool for ToolExecuteTool {
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         // Find the tool directory
-        let (manifest, tool_dir) = find_tool_dir(&args.name, &self.workspace, &self.instance_dir)
+        let (manifest, tool_dir) = find_tool_dir(&args.name, &self.workspace)
             .ok_or_else(|| ToolExecuteError::NotFound(args.name.clone()))?;
 
         // Find the runner script

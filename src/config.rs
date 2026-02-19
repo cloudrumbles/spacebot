@@ -1992,6 +1992,8 @@ pub struct RuntimeConfig {
     pub instance_dir: PathBuf,
     /// Agent workspace directory (e.g., ~/.spacebot/agents/{id}/workspace). Immutable after startup.
     pub workspace_dir: PathBuf,
+    /// Agent data directory (e.g., ~/.spacebot/agents/{id}/data). Immutable after startup.
+    pub data_dir: PathBuf,
     pub routing: ArcSwap<RoutingConfig>,
     pub compaction: ArcSwap<CompactionConfig>,
     pub memory_persistence: ArcSwap<MemoryPersistenceConfig>,
@@ -2045,6 +2047,7 @@ impl RuntimeConfig {
         Self {
             instance_dir: instance_dir.to_path_buf(),
             workspace_dir: agent_config.workspace.clone(),
+            data_dir: agent_config.data_dir.clone(),
             routing: ArcSwap::from_pointee(agent_config.routing.clone()),
             compaction: ArcSwap::from_pointee(agent_config.compaction),
             memory_persistence: ArcSwap::from_pointee(agent_config.memory_persistence),

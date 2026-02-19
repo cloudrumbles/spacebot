@@ -34,21 +34,21 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Start the daemon (default when no subcommand is given)
+    /// Start Spacebot (legacy daemon mode unless --foreground or managed by systemd)
     Start {
         /// Run in the foreground instead of daemonizing
         #[arg(short, long)]
         foreground: bool,
     },
-    /// Stop the running daemon
+    /// Stop the running daemon (legacy mode)
     Stop,
-    /// Restart the daemon (stop + start)
+    /// Restart the daemon (legacy mode)
     Restart {
         /// Run in the foreground instead of daemonizing
         #[arg(short, long)]
         foreground: bool,
     },
-    /// Show status of the running daemon
+    /// Show status (checks systemd user service first, then legacy daemon)
     Status,
     /// Manage skills
     #[command(subcommand)]
@@ -125,10 +125,7 @@ fn main() -> anyhow::Result<()> {
     match command {
         Command::Start { foreground } => cmd_start(cli.config, cli.debug, foreground),
         Command::Stop => cmd_stop(),
-        Command::Restart { foreground } => {
-            cmd_stop_if_running();
-            cmd_start(cli.config, cli.debug, foreground)
-        }
+        Command::Restart { foreground } => cmd_restart(cli.config, cli.debug, foreground),
         Command::Status => cmd_status(),
         Command::Skill(skill_cmd) => cmd_skill(cli.config, skill_cmd),
     }
@@ -139,6 +136,18 @@ fn cmd_start(
     debug: bool,
     foreground: bool,
 ) -> anyhow::Result<()> {
+    if !foreground {
+        if let Some(systemd_status) = query_systemd_user_status("spacebot.service") {
+            if systemd_status.active_state == "active" {
+                eprintln!("spacebot is already running (systemd user service)");
+                return Ok(());
+            }
+            run_systemctl_user("start", "spacebot.service")?;
+            eprintln!("spacebot started (systemd user service)");
+            return Ok(());
+        }
+    }
+
     let paths = spacebot::daemon::DaemonPaths::from_default();
 
     // Bail if already running
@@ -164,6 +173,7 @@ fn cmd_start(
     let should_run_foreground = foreground || managed_environment;
 
     if !should_run_foreground {
+        eprintln!("legacy daemon mode enabled; prefer running under systemd for production");
         // Fork the process before creating any Tokio runtime. After daemonize()
         // returns, we are in the child process — the parent has exited. Any
         // runtime created before this point would be in a broken state inside
@@ -202,6 +212,21 @@ fn cmd_start(
     })
 }
 
+fn cmd_restart(
+    config_path: Option<std::path::PathBuf>,
+    debug: bool,
+    foreground: bool,
+) -> anyhow::Result<()> {
+    if !foreground && query_systemd_user_status("spacebot.service").is_some() {
+        run_systemctl_user("restart", "spacebot.service")?;
+        eprintln!("spacebot restarted (systemd user service)");
+        return Ok(());
+    }
+
+    cmd_stop_if_running();
+    cmd_start(config_path, debug, foreground)
+}
+
 fn running_under_service_manager() -> bool {
     std::env::var_os("INVOCATION_ID").is_some()
         || std::env::var_os("NOTIFY_SOCKET").is_some()
@@ -210,6 +235,12 @@ fn running_under_service_manager() -> bool {
 
 #[tokio::main]
 async fn cmd_stop() -> anyhow::Result<()> {
+    if query_systemd_user_status("spacebot.service").is_some() {
+        run_systemctl_user("stop", "spacebot.service")?;
+        eprintln!("spacebot stopped (systemd user service)");
+        return Ok(());
+    }
+
     let paths = spacebot::daemon::DaemonPaths::from_default();
 
     let Some(pid) = spacebot::daemon::is_running(&paths) else {
@@ -247,6 +278,14 @@ async fn cmd_stop() -> anyhow::Result<()> {
 
 /// Stop if running, don't error if not.
 fn cmd_stop_if_running() {
+    if query_systemd_user_status("spacebot.service")
+        .map(|status| status.active_state == "active")
+        .unwrap_or(false)
+    {
+        let _ = run_systemctl_user("stop", "spacebot.service");
+        return;
+    }
+
     let paths = spacebot::daemon::DaemonPaths::from_default();
 
     let Some(pid) = spacebot::daemon::is_running(&paths) else {
@@ -268,6 +307,24 @@ fn cmd_stop_if_running() {
             spacebot::daemon::wait_for_exit(pid);
         }
     });
+}
+
+fn run_systemctl_user(action: &str, unit_name: &str) -> anyhow::Result<()> {
+    let output = std::process::Command::new("systemctl")
+        .args(["--user", action, unit_name])
+        .output()
+        .with_context(|| format!("failed to execute systemctl --user {action} {unit_name}"))?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let message = stderr.trim();
+    if message.is_empty() {
+        anyhow::bail!("systemctl --user {action} {unit_name} failed");
+    }
+    anyhow::bail!("systemctl --user {action} {unit_name} failed: {message}");
 }
 
 fn cmd_status() -> anyhow::Result<()> {

@@ -207,8 +207,8 @@ pub fn create_worker_tool_server(
         .tool(FileTool::new(workspace.clone()))
         .tool(ExecTool::new(instance_dir.clone(), workspace.clone()))
         .tool(SetStatusTool::new(agent_id, worker_id, channel_id, event_tx))
-        .tool(ToolSearchTool::new(workspace.clone(), instance_dir.clone()))
-        .tool(ToolExecuteTool::new(workspace, instance_dir));
+        .tool(ToolSearchTool::new(workspace.clone()))
+        .tool(ToolExecuteTool::new(workspace));
 
     if browser_config.enabled {
         server = server.tool(BrowserTool::new(browser_config, screenshot_dir));
@@ -254,8 +254,8 @@ pub fn create_cortex_chat_tool_server(
         .tool(ShellTool::new(instance_dir.clone(), workspace.clone()))
         .tool(FileTool::new(workspace.clone()))
         .tool(ExecTool::new(instance_dir.clone(), workspace.clone()))
-        .tool(ToolSearchTool::new(workspace.clone(), instance_dir.clone()))
-        .tool(ToolExecuteTool::new(workspace, instance_dir));
+        .tool(ToolSearchTool::new(workspace.clone()))
+        .tool(ToolExecuteTool::new(workspace));
 
     if browser_config.enabled {
         server = server.tool(BrowserTool::new(browser_config, screenshot_dir));
