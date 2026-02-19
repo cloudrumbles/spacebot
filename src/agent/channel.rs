@@ -20,6 +20,7 @@ use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
+use tracing::Instrument as _;
 use std::collections::HashMap;
 
 const BRANCH_RETRIGGER_DEBOUNCE: Duration = Duration::from_secs(5);
@@ -354,6 +355,7 @@ impl Channel {
     /// Formats all messages with attribution and timestamps, persists each
     /// individually to conversation history, then presents them as one user turn
     /// with a coalesce hint telling the LLM this is a fast-moving conversation.
+    #[tracing::instrument(skip(self, messages), fields(channel_id = %self.id, agent_id = %self.deps.agent_id, message_count = messages.len()))]
     async fn handle_message_batch(&mut self, messages: Vec<InboundMessage>) -> Result<()> {
         let message_count = messages.len();
         let first_timestamp = messages.first().map(|m| m.timestamp).unwrap_or_else(chrono::Utc::now);
@@ -562,6 +564,7 @@ impl Channel {
     /// The LLM decides which tools to call: reply (to respond), branch (to think),
     /// spawn_worker (to delegate), route (to follow up with a worker), cancel, or
     /// memory_save. The tools act on the channel's shared state directly.
+    #[tracing::instrument(skip(self, message), fields(channel_id = %self.id, agent_id = %self.deps.agent_id, message_id = %message.id))]
     async fn handle_message(&mut self, message: InboundMessage) -> Result<()> {
         tracing::info!(
             channel_id = %self.id,
@@ -702,6 +705,7 @@ impl Channel {
     /// Register per-turn tools, run the LLM agentic loop, and clean up.
     ///
     /// Returns the prompt result and skip flag for the caller to dispatch.
+    #[tracing::instrument(skip(self, user_text, system_prompt, attachment_content), fields(channel_id = %self.id, agent_id = %self.deps.agent_id))]
     async fn run_agent_turn(
         &self,
         user_text: &str,
@@ -1126,11 +1130,20 @@ async fn spawn_branch(
     let branch_id = branch.id;
     let prompt = prompt.to_owned();
 
-    let handle = tokio::spawn(async move {
-        if let Err(error) = branch.run(&prompt).await {
-            tracing::error!(branch_id = %branch_id, %error, "branch failed");
+    let branch_span = tracing::info_span!(
+        "branch.run",
+        branch_id = %branch_id,
+        channel_id = %state.channel_id,
+        description = %description,
+    );
+    let handle = tokio::spawn(
+        async move {
+            if let Err(error) = branch.run(&prompt).await {
+                tracing::error!(branch_id = %branch_id, %error, "branch failed");
+            }
         }
-    });
+        .instrument(branch_span),
+    );
 
     {
         let mut branches = state.active_branches.write().await;
@@ -1233,12 +1246,18 @@ pub async fn spawn_worker_from_state(
     
     let worker_id = worker.id;
 
+    let worker_span = tracing::info_span!(
+        "worker.run",
+        worker_id = %worker_id,
+        channel_id = %state.channel_id,
+        task = %task,
+    );
     let handle = spawn_worker_task(
         worker_id,
         state.deps.event_tx.clone(),
         state.deps.agent_id.clone(),
         Some(state.channel_id.clone()),
-        worker.run(),
+        worker.run().instrument(worker_span),
     );
 
     state.worker_handles.write().await.insert(worker_id, handle);
@@ -1315,6 +1334,13 @@ pub async fn spawn_opencode_worker_from_state(
 
     let worker_id = worker.id;
 
+    let worker_span = tracing::info_span!(
+        "worker.run",
+        worker_id = %worker_id,
+        channel_id = %state.channel_id,
+        task = %task,
+        worker_type = "opencode",
+    );
     let handle = spawn_worker_task(
         worker_id,
         state.deps.event_tx.clone(),
@@ -1323,7 +1349,8 @@ pub async fn spawn_opencode_worker_from_state(
         async move {
             let result = worker.run().await?;
             Ok::<String, anyhow::Error>(result.result_text)
-        },
+        }
+        .instrument(worker_span),
     );
 
     state.worker_handles.write().await.insert(worker_id, handle);
