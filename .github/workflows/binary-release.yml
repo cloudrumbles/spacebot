@@ -1,0 +1,104 @@
+name: Binary Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.1.8). Defaults to current tag ref."
+        required: true
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine version
+        id: version
+        run: |
+          if [ -n "${{ github.event.inputs.tag }}" ]; then
+            VERSION="${{ github.event.inputs.tag }}"
+          elif [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/}"
+          else
+            echo "No release tag found. Push a v* tag or provide workflow_dispatch input tag."
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            protobuf-compiler \
+            libprotobuf-dev \
+            cmake \
+            libssl-dev \
+            pkg-config
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Package binary
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          OUT_DIR="dist"
+          mkdir -p "$OUT_DIR"
+          cp target/release/spacebot "$OUT_DIR/spacebot"
+          tar -C "$OUT_DIR" -czf "$OUT_DIR/spacebot-${VERSION}-${{ matrix.arch }}-unknown-linux-gnu.tar.gz" spacebot
+          sha256sum "$OUT_DIR/spacebot-${VERSION}-${{ matrix.arch }}-unknown-linux-gnu.tar.gz" > "$OUT_DIR/spacebot-${VERSION}-${{ matrix.arch }}-unknown-linux-gnu.tar.gz.sha256"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: spacebot-${{ matrix.arch }}
+          path: dist/*
+
+  release:
+    runs-on: ubuntu-24.04
+    needs: build
+    permissions:
+      contents: write
+    steps:
+      - name: Determine version
+        id: version
+        run: |
+          if [ -n "${{ github.event.inputs.tag }}" ]; then
+            VERSION="${{ github.event.inputs.tag }}"
+          elif [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/}"
+          else
+            echo "No release tag found. Push a v* tag or provide workflow_dispatch input tag."
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Publish release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          files: |
+            dist/**/*.tar.gz
+            dist/**/*.sha256
+          generate_release_notes: false
+          fail_on_unmatched_files: true
