@@ -12,14 +12,7 @@ on:
 
 jobs:
   build:
-    strategy:
-      matrix:
-        include:
-          - runner: ubuntu-24.04
-            arch: amd64
-          - runner: ubuntu-24.04-arm
-            arch: arm64
-    runs-on: ${{ matrix.runner }}
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:
@@ -58,15 +51,16 @@ jobs:
         run: |
           VERSION="${{ steps.version.outputs.version }}"
           OUT_DIR="dist"
+          ARCH="amd64"
           mkdir -p "$OUT_DIR"
           cp target/release/spacebot "$OUT_DIR/spacebot"
-          tar -C "$OUT_DIR" -czf "$OUT_DIR/spacebot-${VERSION}-${{ matrix.arch }}-unknown-linux-gnu.tar.gz" spacebot
-          sha256sum "$OUT_DIR/spacebot-${VERSION}-${{ matrix.arch }}-unknown-linux-gnu.tar.gz" > "$OUT_DIR/spacebot-${VERSION}-${{ matrix.arch }}-unknown-linux-gnu.tar.gz.sha256"
+          tar -C "$OUT_DIR" -czf "$OUT_DIR/spacebot-${VERSION}-${ARCH}-unknown-linux-gnu.tar.gz" spacebot
+          sha256sum "$OUT_DIR/spacebot-${VERSION}-${ARCH}-unknown-linux-gnu.tar.gz" > "$OUT_DIR/spacebot-${VERSION}-${ARCH}-unknown-linux-gnu.tar.gz.sha256"
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: spacebot-${{ matrix.arch }}
+          name: spacebot-amd64
           path: dist/*
 
   release:
