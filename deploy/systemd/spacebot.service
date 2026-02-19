@@ -1,0 +1,18 @@
+[Unit]
+Description=Spacebot Agent Daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/workspace/spacebot
+ExecStartPre=/usr/bin/mkdir -p %h/.spacebot
+ExecStartPre=/usr/bin/rm -f %h/.spacebot/spacebot.pid %h/.spacebot/spacebot.sock
+ExecStart=%h/workspace/spacebot/target/release/spacebot start --foreground --config %h/.spacebot/config.toml
+Restart=always
+RestartSec=2
+TimeoutStopSec=30
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=default.target

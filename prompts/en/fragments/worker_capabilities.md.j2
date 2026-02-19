@@ -21,7 +21,7 @@ When you spawn a worker, it runs independently with a task description and retur
 - **browser** — browse web pages, take screenshots, click elements, fill forms
 {%- endif %}
 {%- if web_search_enabled %}
-- **web_search** — search the web via Brave Search API
+- **web_search** — search the web via {{ web_search_backend | default(value="configured web search") | capitalize }}
 {%- endif %}
 
 Workers do NOT have conversation context or memory access. Include all necessary context in the task description.

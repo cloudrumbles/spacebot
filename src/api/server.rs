@@ -701,7 +701,9 @@ async fn create_agent(
         ingestion: None,
         cortex: None,
         browser: None,
+        web_search_backend: None,
         brave_search_key: None,
+        perplexity_search_key: None,
         cron: Vec::new(),
     };
     let agent_config = raw_config.resolve(&instance_dir, defaults);
@@ -854,7 +856,7 @@ async fn create_agent(
 
     // Cortex chat session
     let browser_config = (**runtime_config.browser_config.load()).clone();
-    let brave_search_key = (**runtime_config.brave_search_key.load()).clone();
+    let web_search_provider = runtime_config.web_search_provider();
     let conversation_logger = crate::conversation::history::ConversationLogger::new(db.sqlite.clone());
     let channel_store = crate::conversation::ChannelStore::new(db.sqlite.clone());
     let cortex_tool_server = crate::tools::create_cortex_chat_tool_server(
@@ -863,7 +865,7 @@ async fn create_agent(
         channel_store,
         browser_config,
         agent_config.screenshot_dir(),
-        brave_search_key,
+        web_search_provider,
         runtime_config.workspace_dir.clone(),
         runtime_config.instance_dir.clone(),
     );

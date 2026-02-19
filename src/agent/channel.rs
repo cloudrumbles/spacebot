@@ -16,9 +16,13 @@ use rig::one_or_many::OneOrMany;
 use rig::tool::server::ToolServer;
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
 use tokio::sync::broadcast;
+use tokio::task::JoinHandle;
 use std::collections::HashMap;
+
+const BRANCH_RETRIGGER_DEBOUNCE: Duration = Duration::from_secs(5);
 
 /// Shared state that channel tools need to act on the channel.
 ///
@@ -115,6 +119,8 @@ pub struct Channel {
     coalesce_buffer: Vec<InboundMessage>,
     /// Deadline for flushing the coalesce buffer.
     coalesce_deadline: Option<tokio::time::Instant>,
+    /// Pending debounced retrigger task for branch completions.
+    pending_branch_retrigger: Option<JoinHandle<()>>,
 }
 
 impl Channel {
@@ -188,6 +194,7 @@ impl Channel {
             memory_persistence_branches: HashSet::new(),
             coalesce_buffer: Vec::new(),
             coalesce_deadline: None,
+            pending_branch_retrigger: None,
         };
         
         (channel, message_tx)
@@ -508,10 +515,20 @@ impl Channel {
         let skills_prompt = skills.render_channel_prompt(&prompt_engine);
         
         let browser_enabled = rc.browser_config.load().enabled;
-        let web_search_enabled = rc.brave_search_key.load().is_some();
+        let web_search_provider = rc.web_search_provider();
+        let web_search_enabled = web_search_provider.is_some();
+        let web_search_backend = web_search_provider.map(|provider| match provider.backend {
+            crate::config::WebSearchBackend::Brave => "brave",
+            crate::config::WebSearchBackend::Perplexity => "perplexity",
+        });
         let opencode_enabled = rc.opencode.load().enabled;
         let worker_capabilities = prompt_engine
-            .render_worker_capabilities(browser_enabled, web_search_enabled, opencode_enabled)
+            .render_worker_capabilities(
+                browser_enabled,
+                web_search_enabled,
+                web_search_backend,
+                opencode_enabled,
+            )
             .expect("failed to render worker capabilities");
         
         let status_text = {
@@ -551,6 +568,13 @@ impl Channel {
             message_id = %message.id,
             "handling message"
         );
+
+        // A real inbound message supersedes pending debounced branch re-triggers.
+        if message.source != "system" {
+            if let Some(handle) = self.pending_branch_retrigger.take() {
+                handle.abort();
+            }
+        }
 
         // Track conversation_id for synthetic re-trigger messages
         if self.conversation_id.is_none() {
@@ -639,10 +663,20 @@ impl Channel {
         let skills_prompt = skills.render_channel_prompt(&prompt_engine);
 
         let browser_enabled = rc.browser_config.load().enabled;
-        let web_search_enabled = rc.brave_search_key.load().is_some();
+        let web_search_provider = rc.web_search_provider();
+        let web_search_enabled = web_search_provider.is_some();
+        let web_search_backend = web_search_provider.map(|provider| match provider.backend {
+            crate::config::WebSearchBackend::Brave => "brave",
+            crate::config::WebSearchBackend::Perplexity => "perplexity",
+        });
         let opencode_enabled = rc.opencode.load().enabled;
         let worker_capabilities = prompt_engine
-            .render_worker_capabilities(browser_enabled, web_search_enabled, opencode_enabled)
+            .render_worker_capabilities(
+                browser_enabled,
+                web_search_enabled,
+                web_search_backend,
+                opencode_enabled,
+            )
             .expect("failed to render worker capabilities");
 
         let status_text = {
@@ -702,6 +736,13 @@ impl Channel {
         let routing = rc.routing.load();
         let max_turns = **rc.max_turns.load();
         let model_name = routing.resolve(ProcessType::Channel, None);
+        let provider = crate::llm::routing::provider_from_model(model_name);
+        tracing::info!(
+            channel_id = %self.id,
+            model = %model_name,
+            provider = %provider,
+            "resolved channel model"
+        );
         let model = SpacebotModel::make(&self.deps.llm_manager, model_name)
             .with_routing((**routing).clone());
 
@@ -829,6 +870,7 @@ impl Channel {
         }
 
         let mut should_retrigger = false;
+        let mut should_debounce_branch_retrigger = false;
         let run_logger = &self.state.process_run_logger;
 
         match &event {
@@ -852,7 +894,7 @@ impl Channel {
                     let mut history = self.state.history.write().await;
                     let branch_message = format!("[Branch result]: {conclusion}");
                     history.push(rig::message::Message::from(branch_message));
-                    should_retrigger = true;
+                    should_debounce_branch_retrigger = true;
 
                     tracing::info!(branch_id = %branch_id, "branch result incorporated");
                 }
@@ -885,31 +927,75 @@ impl Channel {
             _ => {}
         }
 
-        // Re-trigger the channel LLM so it can process the result and respond
-        if should_retrigger {
-            if let Some(conversation_id) = &self.conversation_id {
-                let retrigger_message = self.deps.runtime_config
-                    .prompts.load()
-                    .render_system_retrigger()
-                    .expect("failed to render retrigger message");
-
-                let synthetic = InboundMessage {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    source: "system".into(),
-                    conversation_id: conversation_id.clone(),
-                    sender_id: "system".into(),
-                    agent_id: None,
-                    content: crate::MessageContent::Text(retrigger_message),
-                    timestamp: chrono::Utc::now(),
-                    metadata: std::collections::HashMap::new(),
-                };
-                if let Err(error) = self.self_tx.try_send(synthetic) {
-                    tracing::warn!(%error, "failed to re-trigger channel after process completion");
-                }
-            }
+        // Re-trigger the channel LLM so it can process the result and respond.
+        // Branch results are debounced to avoid multi-message bursts when multiple
+        // branches complete in quick succession.
+        if should_debounce_branch_retrigger {
+            self.schedule_branch_retrigger();
+        } else if should_retrigger {
+            self.trigger_channel_retrigger_now();
         }
         
         Ok(())
+    }
+
+    fn trigger_channel_retrigger_now(&self) {
+        if let Some(conversation_id) = &self.conversation_id {
+            let retrigger_message = self.deps.runtime_config
+                .prompts.load()
+                .render_system_retrigger()
+                .expect("failed to render retrigger message");
+
+            let synthetic = InboundMessage {
+                id: uuid::Uuid::new_v4().to_string(),
+                source: "system".into(),
+                conversation_id: conversation_id.clone(),
+                sender_id: "system".into(),
+                agent_id: None,
+                content: crate::MessageContent::Text(retrigger_message),
+                timestamp: chrono::Utc::now(),
+                metadata: std::collections::HashMap::new(),
+            };
+            if let Err(error) = self.self_tx.try_send(synthetic) {
+                tracing::warn!(%error, "failed to re-trigger channel after process completion");
+            }
+        }
+    }
+
+    fn schedule_branch_retrigger(&mut self) {
+        if let Some(handle) = self.pending_branch_retrigger.take() {
+            handle.abort();
+        }
+
+        let Some(conversation_id) = self.conversation_id.clone() else {
+            return;
+        };
+
+        let retrigger_message = self.deps.runtime_config
+            .prompts.load()
+            .render_system_retrigger()
+            .expect("failed to render retrigger message");
+        let self_tx = self.self_tx.clone();
+        let channel_id = self.id.clone();
+
+        self.pending_branch_retrigger = Some(tokio::spawn(async move {
+            tokio::time::sleep(BRANCH_RETRIGGER_DEBOUNCE).await;
+
+            let synthetic = InboundMessage {
+                id: uuid::Uuid::new_v4().to_string(),
+                source: "system".into(),
+                conversation_id,
+                sender_id: "system".into(),
+                agent_id: None,
+                content: crate::MessageContent::Text(retrigger_message),
+                timestamp: chrono::Utc::now(),
+                metadata: std::collections::HashMap::new(),
+            };
+
+            if let Err(error) = self_tx.try_send(synthetic) {
+                tracing::warn!(%error, channel_id = %channel_id, "failed to send debounced branch retrigger");
+            }
+        }));
     }
     
     /// Get the current status block as a string.
@@ -1102,7 +1188,7 @@ pub async fn spawn_worker_from_state(
         .expect("failed to render worker prompt");
     let skills = rc.skills.load();
     let browser_config = (**rc.browser_config.load()).clone();
-    let brave_search_key = (**rc.brave_search_key.load()).clone();
+    let web_search_provider = rc.web_search_provider();
 
     // Build the worker system prompt, optionally prepending skill instructions
     let system_prompt = if let Some(name) = skill_name {
@@ -1124,7 +1210,7 @@ pub async fn spawn_worker_from_state(
             state.deps.clone(),
             browser_config.clone(),
             state.screenshot_dir.clone(),
-            brave_search_key.clone(),
+            web_search_provider.clone(),
             state.logs_dir.clone(),
             task_type.map(str::to_owned),
         );
@@ -1139,7 +1225,7 @@ pub async fn spawn_worker_from_state(
             state.deps.clone(),
             browser_config,
             state.screenshot_dir.clone(),
-            brave_search_key,
+            web_search_provider,
             state.logs_dir.clone(),
             task_type.map(str::to_owned),
         )

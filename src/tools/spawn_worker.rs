@@ -77,7 +77,7 @@ impl Tool for SpawnWorkerTool {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         let rc = &self.state.deps.runtime_config;
         let browser_enabled = rc.browser_config.load().enabled;
-        let web_search_enabled = rc.brave_search_key.load().is_some();
+        let web_search_enabled = rc.web_search_provider().is_some();
         let opencode_enabled = rc.opencode.load().enabled;
 
         let mut tools_list = vec!["shell", "file", "exec"];

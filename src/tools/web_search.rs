@@ -1,21 +1,24 @@
-//! Web search tool using the Brave Search API (task workers only).
+//! Web search tool for task workers.
 
+use crate::config::WebSearchBackend;
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 const BRAVE_WEB_SEARCH_URL: &str = "https://api.search.brave.com/res/v1/web/search";
+const PERPLEXITY_CHAT_URL: &str = "https://api.perplexity.ai/chat/completions";
 
-/// Tool for searching the web via Brave Search.
+/// Tool for searching the web via the configured backend.
 #[derive(Debug, Clone)]
 pub struct WebSearchTool {
     client: reqwest::Client,
+    backend: WebSearchBackend,
     api_key: String,
 }
 
 impl WebSearchTool {
-    pub fn new(api_key: impl Into<String>) -> Self {
+    pub fn new(backend: WebSearchBackend, api_key: impl Into<String>) -> Self {
         let client = reqwest::Client::builder()
             .gzip(true)
             .build()
@@ -23,6 +26,7 @@ impl WebSearchTool {
 
         Self {
             client,
+            backend,
             api_key: api_key.into(),
         }
     }
@@ -37,7 +41,7 @@ pub enum WebSearchError {
     #[error("Failed to parse search response: {0}")]
     InvalidResponse(String),
 
-    #[error("Rate limited by Brave Search API")]
+    #[error("Rate limited by web search provider")]
     RateLimited,
 }
 
@@ -111,6 +115,25 @@ struct BraveWebResult {
     age: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct PerplexityResponse {
+    #[serde(default)]
+    citations: Vec<String>,
+    #[serde(default)]
+    choices: Vec<PerplexityChoice>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PerplexityChoice {
+    message: PerplexityMessage,
+}
+
+#[derive(Debug, Deserialize)]
+struct PerplexityMessage {
+    #[serde(default)]
+    content: String,
+}
+
 impl Tool for WebSearchTool {
     const NAME: &'static str = "web_search";
 
@@ -119,9 +142,17 @@ impl Tool for WebSearchTool {
     type Output = WebSearchOutput;
 
     async fn definition(&self, _prompt: String) -> ToolDefinition {
+        let backend_name = match self.backend {
+            WebSearchBackend::Brave => "Brave Search",
+            WebSearchBackend::Perplexity => "Perplexity",
+        };
+
         ToolDefinition {
             name: Self::NAME.to_string(),
-            description: crate::prompts::text::get("tools/web_search").to_string(),
+            description: format!(
+                "Search the web using {}. Returns page titles, URLs, and description snippets for top results.",
+                backend_name
+            ),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -156,6 +187,15 @@ impl Tool for WebSearchTool {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        match self.backend {
+            WebSearchBackend::Brave => self.call_brave(args).await,
+            WebSearchBackend::Perplexity => self.call_perplexity(args).await,
+        }
+    }
+}
+
+impl WebSearchTool {
+    async fn call_brave(&self, args: WebSearchArgs) -> Result<WebSearchOutput, WebSearchError> {
         let count = args.count.clamp(1, 20);
 
         let mut request = self
@@ -217,6 +257,78 @@ impl Tool for WebSearchTool {
 
         let result_count = results.len();
 
+        Ok(WebSearchOutput {
+            results,
+            query: args.query,
+            result_count,
+        })
+    }
+
+    async fn call_perplexity(
+        &self,
+        args: WebSearchArgs,
+    ) -> Result<WebSearchOutput, WebSearchError> {
+        let count = args.count.clamp(1, 20) as usize;
+        let response = self
+            .client
+            .post(PERPLEXITY_CHAT_URL)
+            .header("Accept", "application/json")
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .json(&serde_json::json!({
+                "model": "sonar",
+                "messages": [{"role": "user", "content": args.query}],
+            }))
+            .send()
+            .await
+            .map_err(|error| WebSearchError::RequestFailed(error.to_string()))?;
+
+        let status = response.status();
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return Err(WebSearchError::RateLimited);
+        }
+        if !status.is_success() {
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "failed to read response body".into());
+            return Err(WebSearchError::RequestFailed(format!(
+                "HTTP {status}: {body}"
+            )));
+        }
+
+        let api_response: PerplexityResponse = response
+            .json()
+            .await
+            .map_err(|error| WebSearchError::InvalidResponse(error.to_string()))?;
+
+        let answer = api_response
+            .choices
+            .first()
+            .map(|choice| choice.message.content.clone())
+            .unwrap_or_default();
+
+        let mut results: Vec<SearchResult> = api_response
+            .citations
+            .into_iter()
+            .take(count)
+            .map(|url| SearchResult {
+                title: "Perplexity citation".to_string(),
+                url,
+                description: answer.clone(),
+                age: None,
+            })
+            .collect();
+
+        if results.is_empty() {
+            results.push(SearchResult {
+                title: "Perplexity answer".to_string(),
+                url: "https://www.perplexity.ai".to_string(),
+                description: answer,
+                age: None,
+            });
+        }
+
+        let result_count = results.len();
         Ok(WebSearchOutput {
             results,
             query: args.query,

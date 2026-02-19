@@ -167,6 +167,7 @@ impl PromptEngine {
         &self,
         browser_enabled: bool,
         web_search_enabled: bool,
+        web_search_backend: Option<&str>,
         opencode_enabled: bool,
     ) -> Result<String> {
         self.render(
@@ -174,6 +175,7 @@ impl PromptEngine {
             context! {
                 browser_enabled => browser_enabled,
                 web_search_enabled => web_search_enabled,
+                web_search_backend => web_search_backend,
                 opencode_enabled => opencode_enabled,
             },
         )

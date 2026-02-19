@@ -82,6 +82,40 @@ impl LlmConfig {
     }
 }
 
+/// Supported backends for the `web_search` tool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WebSearchBackend {
+    Brave,
+    Perplexity,
+}
+
+impl Default for WebSearchBackend {
+    fn default() -> Self {
+        Self::Brave
+    }
+}
+
+impl std::str::FromStr for WebSearchBackend {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "brave" => Ok(Self::Brave),
+            "perplexity" => Ok(Self::Perplexity),
+            other => Err(format!(
+                "invalid web_search_backend: {other}. expected \"brave\" or \"perplexity\""
+            )),
+        }
+    }
+}
+
+/// Resolved web search provider config (selected backend + API key).
+#[derive(Debug, Clone)]
+pub struct WebSearchProviderConfig {
+    pub backend: WebSearchBackend,
+    pub api_key: String,
+}
+
 /// Defaults inherited by all agents. Individual agents can override any field.
 #[derive(Debug, Clone)]
 pub struct DefaultsConfig {
@@ -97,8 +131,12 @@ pub struct DefaultsConfig {
     pub ingestion: IngestionConfig,
     pub cortex: CortexConfig,
     pub browser: BrowserConfig,
+    /// Selected backend for the `web_search` tool.
+    pub web_search_backend: WebSearchBackend,
     /// Brave Search API key for web search tool. Supports "env:VAR_NAME" references.
     pub brave_search_key: Option<String>,
+    /// Perplexity API key for web search tool. Supports "env:VAR_NAME" references.
+    pub perplexity_search_key: Option<String>,
     pub history_backfill_count: usize,
     pub cron: Vec<CronDef>,
     pub opencode: OpenCodeConfig,
@@ -322,8 +360,12 @@ pub struct AgentConfig {
     pub ingestion: Option<IngestionConfig>,
     pub cortex: Option<CortexConfig>,
     pub browser: Option<BrowserConfig>,
+    /// Per-agent web search backend override. None inherits from defaults.
+    pub web_search_backend: Option<WebSearchBackend>,
     /// Per-agent Brave Search API key override. None inherits from defaults.
     pub brave_search_key: Option<String>,
+    /// Per-agent Perplexity API key override. None inherits from defaults.
+    pub perplexity_search_key: Option<String>,
     /// Cron job definitions for this agent.
     pub cron: Vec<CronDef>,
 }
@@ -359,7 +401,9 @@ pub struct ResolvedAgentConfig {
     pub ingestion: IngestionConfig,
     pub cortex: CortexConfig,
     pub browser: BrowserConfig,
+    pub web_search_backend: WebSearchBackend,
     pub brave_search_key: Option<String>,
+    pub perplexity_search_key: Option<String>,
     /// Number of messages to fetch from the platform when a new channel is created.
     pub history_backfill_count: usize,
     pub cron: Vec<CronDef>,
@@ -380,7 +424,9 @@ impl Default for DefaultsConfig {
             ingestion: IngestionConfig::default(),
             cortex: CortexConfig::default(),
             browser: BrowserConfig::default(),
+            web_search_backend: WebSearchBackend::default(),
             brave_search_key: None,
+            perplexity_search_key: None,
             history_backfill_count: 50,
             cron: Vec::new(),
             opencode: OpenCodeConfig::default(),
@@ -426,10 +472,17 @@ impl AgentConfig {
                 .browser
                 .clone()
                 .unwrap_or_else(|| defaults.browser.clone()),
+            web_search_backend: self
+                .web_search_backend
+                .unwrap_or(defaults.web_search_backend),
             brave_search_key: self
                 .brave_search_key
                 .clone()
                 .or_else(|| defaults.brave_search_key.clone()),
+            perplexity_search_key: self
+                .perplexity_search_key
+                .clone()
+                .or_else(|| defaults.perplexity_search_key.clone()),
             history_backfill_count: defaults.history_backfill_count,
             cron: self.cron.clone(),
         }
@@ -897,7 +950,9 @@ struct TomlDefaultsConfig {
     ingestion: Option<TomlIngestionConfig>,
     cortex: Option<TomlCortexConfig>,
     browser: Option<TomlBrowserConfig>,
+    web_search_backend: Option<String>,
     brave_search_key: Option<String>,
+    perplexity_search_key: Option<String>,
     opencode: Option<TomlOpenCodeConfig>,
     worker_log_mode: Option<String>,
 }
@@ -1003,7 +1058,9 @@ struct TomlAgentConfig {
     ingestion: Option<TomlIngestionConfig>,
     cortex: Option<TomlCortexConfig>,
     browser: Option<TomlBrowserConfig>,
+    web_search_backend: Option<String>,
     brave_search_key: Option<String>,
+    perplexity_search_key: Option<String>,
     #[serde(default)]
     cron: Vec<TomlCronDef>,
 }
@@ -1228,7 +1285,9 @@ impl Config {
             ingestion: None,
             cortex: None,
             browser: None,
+            web_search_backend: None,
             brave_search_key: None,
+            perplexity_search_key: None,
             cron: Vec::new(),
         }];
 
@@ -1372,6 +1431,12 @@ impl Config {
         }
 
         let base_defaults = DefaultsConfig::default();
+        let web_search_backend = if let Some(raw) = toml.defaults.web_search_backend.as_deref() {
+            raw.parse::<WebSearchBackend>()
+                .map_err(|error| ConfigError::Invalid(error.to_string()))?
+        } else {
+            base_defaults.web_search_backend
+        };
         let defaults = DefaultsConfig {
             routing: resolve_routing(toml.defaults.routing, &base_defaults.routing),
             max_concurrent_branches: toml
@@ -1500,12 +1565,19 @@ impl Config {
                     }
                 })
                 .unwrap_or_else(|| base_defaults.browser.clone()),
+            web_search_backend,
             brave_search_key: toml
                 .defaults
                 .brave_search_key
                 .as_deref()
                 .and_then(resolve_env_value)
                 .or_else(|| std::env::var("BRAVE_SEARCH_API_KEY").ok()),
+            perplexity_search_key: toml
+                .defaults
+                .perplexity_search_key
+                .as_deref()
+                .and_then(resolve_env_value)
+                .or_else(|| std::env::var("PERPLEXITY_API_KEY").ok()),
             history_backfill_count: base_defaults.history_backfill_count,
             cron: Vec::new(),
             opencode: toml
@@ -1550,7 +1622,7 @@ impl Config {
         let mut agents: Vec<AgentConfig> = toml
             .agents
             .into_iter()
-            .map(|a| {
+            .map(|a| -> Result<AgentConfig> {
                 // Per-agent routing resolves against instance defaults
                 let agent_routing = a
                     .routing
@@ -1568,7 +1640,15 @@ impl Config {
                     })
                     .collect();
 
-                AgentConfig {
+                let web_search_backend = match a.web_search_backend {
+                    Some(raw) => Some(
+                        raw.parse::<WebSearchBackend>()
+                            .map_err(|error| ConfigError::Invalid(error.to_string()))?,
+                    ),
+                    None => None,
+                };
+
+                Ok(AgentConfig {
                     id: a.id,
                     default: a.default,
                     workspace: a.workspace.map(PathBuf::from),
@@ -1660,11 +1740,16 @@ impl Config {
                             .map(PathBuf::from)
                             .or_else(|| defaults.browser.screenshot_dir.clone()),
                     }),
+                    web_search_backend,
                     brave_search_key: a.brave_search_key.as_deref().and_then(resolve_env_value),
+                    perplexity_search_key: a
+                        .perplexity_search_key
+                        .as_deref()
+                        .and_then(resolve_env_value),
                     cron,
-                }
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
 
         if agents.is_empty() {
             agents.push(AgentConfig {
@@ -1683,7 +1768,9 @@ impl Config {
                 ingestion: None,
                 cortex: None,
                 browser: None,
+                web_search_backend: None,
                 brave_search_key: None,
+                perplexity_search_key: None,
                 cron: Vec::new(),
             });
         }
@@ -1821,7 +1908,9 @@ pub struct RuntimeConfig {
     pub max_concurrent_workers: ArcSwap<usize>,
     pub browser_config: ArcSwap<BrowserConfig>,
     pub history_backfill_count: ArcSwap<usize>,
+    pub web_search_backend: ArcSwap<WebSearchBackend>,
     pub brave_search_key: ArcSwap<Option<String>>,
+    pub perplexity_search_key: ArcSwap<Option<String>>,
     pub cortex: ArcSwap<CortexConfig>,
     /// Cached memory bulletin generated by the cortex. Injected into every
     /// channel's system prompt. Empty string until the first cortex run.
@@ -1872,7 +1961,11 @@ impl RuntimeConfig {
             max_concurrent_workers: ArcSwap::from_pointee(agent_config.max_concurrent_workers),
             browser_config: ArcSwap::from_pointee(agent_config.browser.clone()),
             history_backfill_count: ArcSwap::from_pointee(agent_config.history_backfill_count),
+            web_search_backend: ArcSwap::from_pointee(agent_config.web_search_backend),
             brave_search_key: ArcSwap::from_pointee(agent_config.brave_search_key.clone()),
+            perplexity_search_key: ArcSwap::from_pointee(
+                agent_config.perplexity_search_key.clone(),
+            ),
             cortex: ArcSwap::from_pointee(agent_config.cortex),
             memory_bulletin: ArcSwap::from_pointee(String::new()),
             prompts: ArcSwap::from_pointee(prompts),
@@ -1932,8 +2025,12 @@ impl RuntimeConfig {
         self.browser_config.store(Arc::new(resolved.browser));
         self.history_backfill_count
             .store(Arc::new(resolved.history_backfill_count));
+        self.web_search_backend
+            .store(Arc::new(resolved.web_search_backend));
         self.brave_search_key
             .store(Arc::new(resolved.brave_search_key));
+        self.perplexity_search_key
+            .store(Arc::new(resolved.perplexity_search_key));
         self.cortex.store(Arc::new(resolved.cortex));
 
         tracing::info!(agent_id, "runtime config reloaded");
@@ -1949,6 +2046,30 @@ impl RuntimeConfig {
     pub fn reload_skills(&self, skills: crate::skills::SkillSet) {
         self.skills.store(Arc::new(skills));
         tracing::info!("skills reloaded");
+    }
+
+    /// Resolve the currently active web search backend and key.
+    pub fn web_search_provider(&self) -> Option<WebSearchProviderConfig> {
+        match **self.web_search_backend.load() {
+            WebSearchBackend::Brave => self
+                .brave_search_key
+                .load()
+                .as_ref()
+                .clone()
+                .map(|api_key| WebSearchProviderConfig {
+                    backend: WebSearchBackend::Brave,
+                    api_key,
+                }),
+            WebSearchBackend::Perplexity => self
+                .perplexity_search_key
+                .load()
+                .as_ref()
+                .clone()
+                .map(|api_key| WebSearchProviderConfig {
+                    backend: WebSearchBackend::Perplexity,
+                    api_key,
+                }),
+        }
     }
 }
 

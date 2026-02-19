@@ -1027,6 +1027,7 @@ fn parse_anthropic_response(
         .ok_or_else(|| CompletionError::ResponseError("missing content array".into()))?;
 
     let mut assistant_content = Vec::new();
+    let mut saw_thinking_block = false;
 
     for block in content_blocks {
         match block["type"].as_str() {
@@ -1041,8 +1042,21 @@ fn parse_anthropic_response(
                 assistant_content
                     .push(AssistantContent::ToolCall(make_tool_call(id, name, arguments)));
             }
+            Some("thinking") | Some("redacted_thinking") => {
+                // These are provider-side reasoning blocks. They can appear without a
+                // final text/tool block, which previously caused an empty-response error.
+                saw_thinking_block = true;
+            }
             _ => {}
         }
+    }
+
+    if assistant_content.is_empty() && saw_thinking_block {
+        // Return an empty assistant text instead of raising an error. Channel/worker
+        // logic already treats empty text as "no direct reply".
+        assistant_content.push(AssistantContent::Text(Text {
+            text: String::new(),
+        }));
     }
 
     let choice = OneOrMany::many(assistant_content)

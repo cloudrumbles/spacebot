@@ -64,7 +64,7 @@ pub use send_file::{SendFileTool, SendFileArgs, SendFileOutput, SendFileError};
 pub use dynamic::{ToolSearchTool, ToolExecuteTool};
 
 use crate::agent::channel::ChannelState;
-use crate::config::BrowserConfig;
+use crate::config::{BrowserConfig, WebSearchProviderConfig};
 use crate::memory::MemorySearch;
 use crate::{AgentId, ChannelId, OutboundResponse, ProcessEvent, WorkerId};
 use rig::tool::Tool as _;
@@ -198,7 +198,7 @@ pub fn create_worker_tool_server(
     event_tx: broadcast::Sender<ProcessEvent>,
     browser_config: BrowserConfig,
     screenshot_dir: PathBuf,
-    brave_search_key: Option<String>,
+    web_search_provider: Option<WebSearchProviderConfig>,
     workspace: PathBuf,
     instance_dir: PathBuf,
 ) -> ToolServerHandle {
@@ -214,8 +214,8 @@ pub fn create_worker_tool_server(
         server = server.tool(BrowserTool::new(browser_config, screenshot_dir));
     }
 
-    if let Some(key) = brave_search_key {
-        server = server.tool(WebSearchTool::new(key));
+    if let Some(provider) = web_search_provider {
+        server = server.tool(WebSearchTool::new(provider.backend, provider.api_key));
     }
 
     server.run()
@@ -242,7 +242,7 @@ pub fn create_cortex_chat_tool_server(
     channel_store: crate::conversation::ChannelStore,
     browser_config: BrowserConfig,
     screenshot_dir: PathBuf,
-    brave_search_key: Option<String>,
+    web_search_provider: Option<WebSearchProviderConfig>,
     workspace: PathBuf,
     instance_dir: PathBuf,
 ) -> ToolServerHandle {
@@ -261,8 +261,8 @@ pub fn create_cortex_chat_tool_server(
         server = server.tool(BrowserTool::new(browser_config, screenshot_dir));
     }
 
-    if let Some(key) = brave_search_key {
-        server = server.tool(WebSearchTool::new(key));
+    if let Some(provider) = web_search_provider {
+        server = server.tool(WebSearchTool::new(provider.backend, provider.api_key));
     }
 
     server.run()

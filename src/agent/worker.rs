@@ -2,6 +2,7 @@
 
 use crate::agent::compactor::estimate_history_tokens;
 use crate::config::BrowserConfig;
+use crate::config::WebSearchProviderConfig;
 use crate::error::Result;
 use crate::llm::routing::is_context_overflow_error;
 use crate::llm::SpacebotModel;
@@ -50,8 +51,8 @@ pub struct Worker {
     pub browser_config: BrowserConfig,
     /// Directory for browser screenshots.
     pub screenshot_dir: PathBuf,
-    /// Brave Search API key for web search tool.
-    pub brave_search_key: Option<String>,
+    /// Selected web search backend and API key for this worker.
+    pub web_search_provider: Option<WebSearchProviderConfig>,
     /// Directory for writing execution logs on failure.
     pub logs_dir: PathBuf,
     /// Task type for model routing (e.g. "coding", "summarization", "deep_reasoning").
@@ -70,7 +71,7 @@ impl Worker {
         deps: AgentDeps,
         browser_config: BrowserConfig,
         screenshot_dir: PathBuf,
-        brave_search_key: Option<String>,
+        web_search_provider: Option<WebSearchProviderConfig>,
         logs_dir: PathBuf,
         task_type: Option<String>,
     ) -> Self {
@@ -90,7 +91,7 @@ impl Worker {
             input_rx: None,
             browser_config,
             screenshot_dir,
-            brave_search_key,
+            web_search_provider,
             logs_dir,
             task_type,
             status_tx,
@@ -106,7 +107,7 @@ impl Worker {
         deps: AgentDeps,
         browser_config: BrowserConfig,
         screenshot_dir: PathBuf,
-        brave_search_key: Option<String>,
+        web_search_provider: Option<WebSearchProviderConfig>,
         logs_dir: PathBuf,
         task_type: Option<String>,
     ) -> (Self, mpsc::Sender<String>) {
@@ -127,7 +128,7 @@ impl Worker {
             input_rx: Some(input_rx),
             browser_config,
             screenshot_dir,
-            brave_search_key,
+            web_search_provider,
             logs_dir,
             task_type,
             status_tx,
@@ -183,13 +184,22 @@ impl Worker {
             self.deps.event_tx.clone(),
             self.browser_config.clone(),
             self.screenshot_dir.clone(),
-            self.brave_search_key.clone(),
+            self.web_search_provider.clone(),
             self.deps.runtime_config.workspace_dir.clone(),
             self.deps.runtime_config.instance_dir.clone(),
         );
 
         let routing = self.deps.runtime_config.routing.load();
         let model_name = routing.resolve(ProcessType::Worker, self.task_type.as_deref()).to_string();
+        let provider = crate::llm::routing::provider_from_model(&model_name);
+        tracing::info!(
+            worker_id = %self.id,
+            channel_id = ?self.channel_id,
+            task_type = ?self.task_type,
+            model = %model_name,
+            provider = %provider,
+            "resolved worker model"
+        );
         let model = SpacebotModel::make(&self.deps.llm_manager, &model_name)
             .with_routing((**routing).clone());
 

@@ -9,6 +9,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
+#[derive(Debug)]
+struct SystemdStatus {
+    active_state: String,
+    sub_state: String,
+    main_pid: Option<u32>,
+}
+
 #[derive(Parser)]
 #[command(name = "spacebot", version)]
 #[command(about = "A Rust agentic system with dedicated processes for every task")]
@@ -255,6 +262,27 @@ fn cmd_stop_if_running() {
 }
 
 fn cmd_status() -> anyhow::Result<()> {
+    if let Some(systemd_status) = query_systemd_user_status("spacebot.service") {
+        if systemd_status.active_state == "active" {
+            eprintln!("spacebot is running (systemd user service)");
+            if let Some(pid) = systemd_status.main_pid {
+                eprintln!("  pid:    {pid}");
+            }
+            eprintln!(
+                "  state:  {}/{}",
+                systemd_status.active_state, systemd_status.sub_state
+            );
+            return Ok(());
+        }
+
+        eprintln!("spacebot is not running");
+        eprintln!(
+            "  systemd state: {}/{}",
+            systemd_status.active_state, systemd_status.sub_state
+        );
+        std::process::exit(1);
+    }
+
     let paths = spacebot::daemon::DaemonPaths::from_default();
 
     let Some(_pid) = spacebot::daemon::is_running(&paths) else {
@@ -293,6 +321,56 @@ fn cmd_status() -> anyhow::Result<()> {
     });
 
     Ok(())
+}
+
+fn query_systemd_user_status(unit_name: &str) -> Option<SystemdStatus> {
+    let output = std::process::Command::new("systemctl")
+        .args([
+            "--user",
+            "show",
+            unit_name,
+            "--property=LoadState,ActiveState,SubState,MainPID",
+        ])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut load_state: Option<String> = None;
+    let mut active_state: Option<String> = None;
+    let mut sub_state: Option<String> = None;
+    let mut main_pid: Option<u32> = None;
+
+    for line in text.lines() {
+        if let Some((key, value)) = line.split_once('=') {
+            match key {
+                "LoadState" => load_state = Some(value.to_string()),
+                "ActiveState" => active_state = Some(value.to_string()),
+                "SubState" => sub_state = Some(value.to_string()),
+                "MainPID" => {
+                    if let Ok(pid) = value.parse::<u32>() {
+                        if pid > 0 {
+                            main_pid = Some(pid);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if load_state.as_deref() == Some("not-found") {
+        return None;
+    }
+
+    Some(SystemdStatus {
+        active_state: active_state.unwrap_or_else(|| "unknown".to_string()),
+        sub_state: sub_state.unwrap_or_else(|| "unknown".to_string()),
+        main_pid,
+    })
 }
 
 fn cmd_skill(
@@ -1311,7 +1389,7 @@ async fn initialize_agents(
         let mut sessions = std::collections::HashMap::new();
         for (agent_id, agent) in agents.iter() {
             let browser_config = (**agent.deps.runtime_config.browser_config.load()).clone();
-            let brave_search_key = (**agent.deps.runtime_config.brave_search_key.load()).clone();
+            let web_search_provider = agent.deps.runtime_config.web_search_provider();
             let conversation_logger = spacebot::conversation::history::ConversationLogger::new(agent.db.sqlite.clone());
             let channel_store = spacebot::conversation::ChannelStore::new(agent.db.sqlite.clone());
             let tool_server = spacebot::tools::create_cortex_chat_tool_server(
@@ -1320,7 +1398,7 @@ async fn initialize_agents(
                 channel_store,
                 browser_config,
                 agent.config.screenshot_dir(),
-                brave_search_key,
+                web_search_provider,
                 agent.deps.runtime_config.workspace_dir.clone(),
                 agent.deps.runtime_config.instance_dir.clone(),
             );
