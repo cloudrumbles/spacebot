@@ -203,16 +203,15 @@ Images are built and pushed to `ghcr.io/spacedriveapp/spacebot` via GitHub Actio
 
 **Triggers:**
 
-- Push a `v*` tag (e.g. `git tag v0.1.0 && git push --tags`)
+- Push a `v*` tag (e.g. `git tag v0.1.8 && git push --tags`)
 - Manual dispatch from the Actions tab
 
 **Tags pushed per release:**
 
 | Tag           | Description                |
 | ------------- | -------------------------- |
-| `v0.1.0-slim` | Versioned slim             |
-| `v0.1.0-full` | Versioned full             |
-| `v0.1.0`      | Versioned (points to full) |
+| `v0.1.8-slim` | Versioned slim             |
+| `v0.1.8-full` | Versioned full             |
 | `slim`        | Rolling slim               |
 | `full`        | Rolling full               |
 | `latest`      | Rolling (points to full)   |

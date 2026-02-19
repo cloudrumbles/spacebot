@@ -154,7 +154,15 @@ fn cmd_start(
     // Validate config loads successfully before forking
     let config = load_config(&resolved_config_path)?;
 
-    if foreground {
+    let managed_environment = running_under_service_manager();
+    let should_run_foreground = foreground || managed_environment;
+
+    if should_run_foreground {
+        if !foreground && managed_environment {
+            eprintln!(
+                "detected service manager environment, running in foreground mode automatically"
+            );
+        }
         spacebot::daemon::init_foreground_tracing(debug);
     } else {
         // Derive paths from the loaded config's instance dir
@@ -168,7 +176,13 @@ fn cmd_start(
         .enable_all()
         .build()
         .context("failed to build tokio runtime")?
-        .block_on(run(config, foreground))
+        .block_on(run(config, should_run_foreground))
+}
+
+fn running_under_service_manager() -> bool {
+    std::env::var_os("INVOCATION_ID").is_some()
+        || std::env::var_os("NOTIFY_SOCKET").is_some()
+        || std::env::var_os("JOURNAL_STREAM").is_some()
 }
 
 fn cmd_stop() -> anyhow::Result<()> {

@@ -1,0 +1,94 @@
+---
+title: GCP Compute Engine
+description: Deploy Spacebot to a Google Compute Engine VM with Docker and systemd.
+---
+
+# GCP Compute Engine
+
+This guide deploys Spacebot on a single Ubuntu VM in Google Cloud using Docker Compose and `systemd`.
+
+## 1) Create the VM
+
+Use Ubuntu 24.04 LTS and allow HTTP traffic to the API/UI port if you need remote access.
+
+```bash
+gcloud compute instances create spacebot-vm \
+  --zone=us-central1-a \
+  --machine-type=e2-standard-2 \
+  --image-family=ubuntu-2404-lts-amd64 \
+  --image-project=ubuntu-os-cloud \
+  --boot-disk-size=30GB \
+  --tags=spacebot-http
+
+# Optional firewall rule for the web UI/API port
+gcloud compute firewall-rules create allow-spacebot-19898 \
+  --allow=tcp:19898 \
+  --target-tags=spacebot-http
+```
+
+## 2) Install and start Spacebot
+
+SSH to the VM, clone the repo, then run the installer:
+
+```bash
+gcloud compute ssh spacebot-vm --zone=us-central1-a
+
+git clone https://github.com/spacedriveapp/spacebot.git
+cd spacebot
+sudo ./deploy/gcp/install.sh
+```
+
+The installer:
+
+- Installs Docker Engine + Compose plugin (if missing)
+- Creates `/opt/spacebot`, `/var/lib/spacebot`, `/etc/spacebot`
+- Installs a `spacebot.service` unit from `deploy/gcp/spacebot-docker.service`
+- Enables and starts `spacebot.service`
+
+## 3) Configure API keys
+
+Edit `/etc/spacebot/spacebot.env` and add at least one provider key:
+
+```bash
+sudo nano /etc/spacebot/spacebot.env
+sudo systemctl restart spacebot
+```
+
+## 4) Verify health
+
+```bash
+sudo systemctl status spacebot --no-pager
+curl http://127.0.0.1:19898/api/health
+```
+
+## Data locations
+
+- Runtime data: `/var/lib/spacebot`
+- Environment file: `/etc/spacebot/spacebot.env`
+- Compose file: `/opt/spacebot/docker-compose.yml`
+
+## Updating to a newer Spacebot version
+
+Pin the image tag in `/opt/spacebot/docker-compose.yml`, then restart the service:
+
+```yaml
+image: ghcr.io/spacedriveapp/spacebot:v0.1.8-slim
+```
+
+```bash
+sudo systemctl restart spacebot
+sudo docker ps --filter name=spacebot
+```
+
+If you prefer rolling updates, keep `:slim` and run:
+
+```bash
+cd /opt/spacebot
+sudo docker compose pull
+sudo docker compose up -d
+```
+
+## Notes
+
+- `spacebot` runs in foreground mode inside the container (`start --foreground`), which is ideal under `systemd`.
+- For production, prefer private access (Cloud VPN/Tailscale/IAP) instead of exposing `19898` publicly.

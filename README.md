@@ -320,7 +320,7 @@ Read the full vision in the [roadmap](docs/content/docs/(deployment)/roadmap.mdx
 
 ### Prerequisites
 
-- **Rust** 1.85+ ([rustup](https://rustup.rs/))
+- **Rust** stable ([rustup](https://rustup.rs/))
 - An LLM API key from any supported provider (Anthropic, OpenAI, OpenRouter, Z.ai, Groq, Together, Fireworks, DeepSeek, xAI, Mistral, or OpenCode Zen)
 
 ### Build and Run
@@ -394,6 +394,7 @@ No server dependencies. Single binary. All data lives in embedded databases in a
 | -------------------------------------- | -------------------------------------------------------- |
 | [Quick Start](docs/content/docs/(getting-started)/quickstart.mdx) | Setup, config, first run                                 |
 | [Config Reference](docs/content/docs/(configuration)/config.mdx) | Full `config.toml` reference                             |
+| [GCP Deployment](docs/content/docs/(deployment)/gcp-compute-engine.mdx) | Deploy to a Google Compute Engine VM                     |
 | [Agents](docs/content/docs/(core)/agents.mdx)                    | Multi-agent setup and isolation                          |
 | [Memory](docs/content/docs/(core)/memory.mdx)                    | Memory system design                                     |
 | [Tools](docs/content/docs/(features)/tools.mdx)                  | All available LLM tools                                  |
