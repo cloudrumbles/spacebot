@@ -1395,6 +1395,7 @@ async fn initialize_agents(
         api_state.set_discord_permissions(perms.clone()).await;
     }
 
+    #[cfg(feature = "discord")]
     if let Some(discord_config) = &config.messaging.discord {
         if discord_config.enabled {
             let adapter = spacebot::messaging::discord::DiscordAdapter::new(
@@ -1404,6 +1405,14 @@ async fn initialize_agents(
                     .expect("discord permissions initialized when discord is enabled"),
             );
             new_messaging_manager.register(adapter).await;
+        }
+    }
+    #[cfg(not(feature = "discord"))]
+    if let Some(discord_config) = &config.messaging.discord {
+        if discord_config.enabled {
+            tracing::warn!(
+                "discord is enabled in config, but this binary was built without the `discord` feature"
+            );
         }
     }
 
@@ -1416,6 +1425,7 @@ async fn initialize_agents(
         api_state.set_slack_permissions(perms.clone()).await;
     }
 
+    #[cfg(feature = "slack")]
     if let Some(slack_config) = &config.messaging.slack {
         if slack_config.enabled {
             match spacebot::messaging::slack::SlackAdapter::new(
@@ -1433,6 +1443,14 @@ async fn initialize_agents(
                     tracing::error!(%error, "failed to build slack adapter");
                 }
             }
+        }
+    }
+    #[cfg(not(feature = "slack"))]
+    if let Some(slack_config) = &config.messaging.slack {
+        if slack_config.enabled {
+            tracing::warn!(
+                "slack is enabled in config, but this binary was built without the `slack` feature"
+            );
         }
     }
 
@@ -1472,6 +1490,7 @@ async fn initialize_agents(
         Arc::new(ArcSwap::from_pointee(perms))
     });
 
+    #[cfg(feature = "twitch")]
     if let Some(twitch_config) = &config.messaging.twitch {
         if twitch_config.enabled {
             let adapter = spacebot::messaging::twitch::TwitchAdapter::new(
@@ -1484,6 +1503,14 @@ async fn initialize_agents(
                     .expect("twitch permissions initialized when twitch is enabled"),
             );
             new_messaging_manager.register(adapter).await;
+        }
+    }
+    #[cfg(not(feature = "twitch"))]
+    if let Some(twitch_config) = &config.messaging.twitch {
+        if twitch_config.enabled {
+            tracing::warn!(
+                "twitch is enabled in config, but this binary was built without the `twitch` feature"
+            );
         }
     }
 

@@ -344,75 +344,94 @@ pub(super) async fn create_binding(
         let manager_guard = state.messaging_manager.read().await;
         if let Some(manager) = manager_guard.as_ref() {
             if let Some(token) = new_discord_token {
-                let discord_perms = {
-                    let perms_guard = state.discord_permissions.read().await;
-                    match perms_guard.as_ref() {
-                        Some(existing) => existing.clone(),
-                        None => {
-                            drop(perms_guard);
-                            let perms = crate::config::DiscordPermissions::from_config(
-                                new_config
-                                    .messaging
-                                    .discord
-                                    .as_ref()
-                                    .expect("discord config exists when token is provided"),
-                                &new_config.bindings,
-                            );
-                            let arc_swap =
-                                std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(perms));
-                            state.set_discord_permissions(arc_swap.clone()).await;
-                            arc_swap
+                #[cfg(feature = "discord")]
+                {
+                    let discord_perms = {
+                        let perms_guard = state.discord_permissions.read().await;
+                        match perms_guard.as_ref() {
+                            Some(existing) => existing.clone(),
+                            None => {
+                                drop(perms_guard);
+                                let perms = crate::config::DiscordPermissions::from_config(
+                                    new_config
+                                        .messaging
+                                        .discord
+                                        .as_ref()
+                                        .expect("discord config exists when token is provided"),
+                                    &new_config.bindings,
+                                );
+                                let arc_swap =
+                                    std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(perms));
+                                state.set_discord_permissions(arc_swap.clone()).await;
+                                arc_swap
+                            }
                         }
+                    };
+                    let adapter =
+                        crate::messaging::discord::DiscordAdapter::new(&token, discord_perms);
+                    if let Err(error) = manager.register_and_start(adapter).await {
+                        tracing::error!(%error, "failed to hot-start discord adapter");
                     }
-                };
-                let adapter = crate::messaging::discord::DiscordAdapter::new(&token, discord_perms);
-                if let Err(error) = manager.register_and_start(adapter).await {
-                    tracing::error!(%error, "failed to hot-start discord adapter");
+                }
+                #[cfg(not(feature = "discord"))]
+                {
+                    tracing::warn!(
+                        "discord credentials changed, but this binary was built without the `discord` feature"
+                    );
                 }
             }
 
             if let Some((bot_token, app_token)) = new_slack_tokens {
-                let slack_perms = {
-                    let perms_guard = state.slack_permissions.read().await;
-                    match perms_guard.as_ref() {
-                        Some(existing) => existing.clone(),
-                        None => {
-                            drop(perms_guard);
-                            let perms = crate::config::SlackPermissions::from_config(
-                                new_config
-                                    .messaging
-                                    .slack
-                                    .as_ref()
-                                    .expect("slack config exists when tokens are provided"),
-                                &new_config.bindings,
-                            );
-                            let arc_swap =
-                                std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(perms));
-                            state.set_slack_permissions(arc_swap.clone()).await;
-                            arc_swap
+                #[cfg(feature = "slack")]
+                {
+                    let slack_perms = {
+                        let perms_guard = state.slack_permissions.read().await;
+                        match perms_guard.as_ref() {
+                            Some(existing) => existing.clone(),
+                            None => {
+                                drop(perms_guard);
+                                let perms = crate::config::SlackPermissions::from_config(
+                                    new_config
+                                        .messaging
+                                        .slack
+                                        .as_ref()
+                                        .expect("slack config exists when tokens are provided"),
+                                    &new_config.bindings,
+                                );
+                                let arc_swap =
+                                    std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(perms));
+                                state.set_slack_permissions(arc_swap.clone()).await;
+                                arc_swap
+                            }
+                        }
+                    };
+                    let slack_commands = new_config
+                        .messaging
+                        .slack
+                        .as_ref()
+                        .map(|s| s.commands.clone())
+                        .unwrap_or_default();
+                    match crate::messaging::slack::SlackAdapter::new(
+                        &bot_token,
+                        &app_token,
+                        slack_perms,
+                        slack_commands,
+                    ) {
+                        Ok(adapter) => {
+                            if let Err(error) = manager.register_and_start(adapter).await {
+                                tracing::error!(%error, "failed to hot-start slack adapter");
+                            }
+                        }
+                        Err(error) => {
+                            tracing::error!(%error, "failed to build slack adapter");
                         }
                     }
-                };
-                let slack_commands = new_config
-                    .messaging
-                    .slack
-                    .as_ref()
-                    .map(|s| s.commands.clone())
-                    .unwrap_or_default();
-                match crate::messaging::slack::SlackAdapter::new(
-                    &bot_token,
-                    &app_token,
-                    slack_perms,
-                    slack_commands,
-                ) {
-                    Ok(adapter) => {
-                        if let Err(error) = manager.register_and_start(adapter).await {
-                            tracing::error!(%error, "failed to hot-start slack adapter");
-                        }
-                    }
-                    Err(error) => {
-                        tracing::error!(%error, "failed to build slack adapter");
-                    }
+                }
+                #[cfg(not(feature = "slack"))]
+                {
+                    tracing::warn!(
+                        "slack credentials changed, but this binary was built without the `slack` feature"
+                    );
                 }
             }
 
@@ -436,27 +455,36 @@ pub(super) async fn create_binding(
             }
 
             if let Some((username, oauth_token)) = new_twitch_creds {
-                let twitch_config = new_config
-                    .messaging
-                    .twitch
-                    .as_ref()
-                    .expect("twitch config exists when credentials are provided");
-                let twitch_perms = {
-                    let perms = crate::config::TwitchPermissions::from_config(
-                        twitch_config,
-                        &new_config.bindings,
+                #[cfg(feature = "twitch")]
+                {
+                    let twitch_config = new_config
+                        .messaging
+                        .twitch
+                        .as_ref()
+                        .expect("twitch config exists when credentials are provided");
+                    let twitch_perms = {
+                        let perms = crate::config::TwitchPermissions::from_config(
+                            twitch_config,
+                            &new_config.bindings,
+                        );
+                        std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(perms))
+                    };
+                    let adapter = crate::messaging::twitch::TwitchAdapter::new(
+                        &username,
+                        &oauth_token,
+                        twitch_config.channels.clone(),
+                        twitch_config.trigger_prefix.clone(),
+                        twitch_perms,
                     );
-                    std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(perms))
-                };
-                let adapter = crate::messaging::twitch::TwitchAdapter::new(
-                    &username,
-                    &oauth_token,
-                    twitch_config.channels.clone(),
-                    twitch_config.trigger_prefix.clone(),
-                    twitch_perms,
-                );
-                if let Err(error) = manager.register_and_start(adapter).await {
-                    tracing::error!(%error, "failed to hot-start twitch adapter");
+                    if let Err(error) = manager.register_and_start(adapter).await {
+                        tracing::error!(%error, "failed to hot-start twitch adapter");
+                    }
+                }
+                #[cfg(not(feature = "twitch"))]
+                {
+                    tracing::warn!(
+                        "twitch credentials changed, but this binary was built without the `twitch` feature"
+                    );
                 }
             }
         }

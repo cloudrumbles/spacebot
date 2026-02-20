@@ -151,6 +151,9 @@ pub fn defaults_for_provider(provider: &str) -> RoutingConfig {
         "minimax" => RoutingConfig::for_model("minimax/MiniMax-M1-80k".into()),
         "moonshot" => RoutingConfig::for_model("moonshot/kimi-k2.5".into()),
         "zai-coding-plan" => RoutingConfig::for_model("zai-coding-plan/glm-5".into()),
+        "google-antigravity" => {
+            RoutingConfig::for_model("google-antigravity/claude-opus-4-6-thinking".into())
+        }
         _ => RoutingConfig::default(),
     }
 }
@@ -173,6 +176,7 @@ pub fn provider_to_prefix(provider: &str) -> &str {
         "minimax" => "minimax/",
         "moonshot" => "moonshot/",
         "zai-coding-plan" => "zai-coding-plan/",
+        "google-antigravity" => "google-antigravity/",
         _ => "",
     }
 }

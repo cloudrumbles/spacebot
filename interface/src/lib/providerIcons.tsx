@@ -69,6 +69,26 @@ function OpenCodeZenIcon({ size = 24, className }: IconProps) {
 	);
 }
 
+function GoogleAntigravityIcon({ size = 24, className }: IconProps) {
+	return (
+		<svg
+			width={size}
+			height={size}
+			viewBox="0 0 24 24"
+			fill="none"
+			xmlns="http://www.w3.org/2000/svg"
+			className={className}
+			aria-hidden="true"
+			focusable="false"
+		>
+			<circle cx="12" cy="12" r="9" stroke="currentColor" strokeWidth="1.6" opacity="0.35" />
+			<path d="M8 12.2a4 4 0 0 0 7.7 1.5" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+			<path d="M16.2 10H12" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+			<path d="M12 10v4" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+		</svg>
+	);
+}
+
 function OllamaIcon({ size = 24, className }: IconProps) {
 	return (
 		<svg
@@ -109,6 +129,7 @@ export function ProviderIcon({ provider, className = "text-ink-faint", size = 24
 		"zai-coding-plan": ZAI,
 		ollama: OllamaIcon,
 		"opencode-zen": OpenCodeZenIcon,
+		"google-antigravity": GoogleAntigravityIcon,
 		nvidia: NvidiaIcon,
 		minimax: Minimax,
 		moonshot: Kimi, // Kimi is Moonshot AI's product brand

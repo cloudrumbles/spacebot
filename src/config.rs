@@ -150,6 +150,7 @@ pub struct LlmConfig {
     pub minimax_key: Option<String>,
     pub moonshot_key: Option<String>,
     pub zai_coding_plan_key: Option<String>,
+    pub google_antigravity_key: Option<String>,
     pub providers: HashMap<String, ProviderConfig>,
 }
 
@@ -173,6 +174,7 @@ impl LlmConfig {
             || self.minimax_key.is_some()
             || self.moonshot_key.is_some()
             || self.zai_coding_plan_key.is_some()
+            || self.google_antigravity_key.is_some()
             || !self.providers.is_empty()
     }
 }
@@ -217,6 +219,8 @@ const OPENROUTER_PROVIDER_BASE_URL: &str = "https://openrouter.ai/api";
 const OPENCODE_ZEN_PROVIDER_BASE_URL: &str = "https://opencode.ai/zen";
 const MINIMAX_PROVIDER_BASE_URL: &str = "https://api.minimax.io/anthropic";
 const MOONSHOT_PROVIDER_BASE_URL: &str = "https://api.moonshot.ai";
+const GOOGLE_ANTIGRAVITY_PROVIDER_BASE_URL: &str =
+    "https://daily-cloudcode-pa.sandbox.googleapis.com";
 
 const ZHIPU_PROVIDER_BASE_URL: &str = "https://api.z.ai/api/paas/v4";
 const ZAI_CODING_PLAN_BASE_URL: &str = "https://api.z.ai/api/coding/paas/v4";
@@ -1167,6 +1171,7 @@ struct TomlLlmConfigFields {
     minimax_key: Option<String>,
     moonshot_key: Option<String>,
     zai_coding_plan_key: Option<String>,
+    google_antigravity_key: Option<String>,
     #[serde(default)]
     providers: HashMap<String, TomlProviderConfig>,
     #[serde(default)]
@@ -1193,6 +1198,7 @@ struct TomlLlmConfig {
     minimax_key: Option<String>,
     moonshot_key: Option<String>,
     zai_coding_plan_key: Option<String>,
+    google_antigravity_key: Option<String>,
     providers: HashMap<String, TomlProviderConfig>,
 }
 
@@ -1244,6 +1250,7 @@ impl<'de> Deserialize<'de> for TomlLlmConfig {
             minimax_key: fields.minimax_key,
             moonshot_key: fields.moonshot_key,
             zai_coding_plan_key: fields.zai_coding_plan_key,
+            google_antigravity_key: fields.google_antigravity_key,
             providers: fields.providers,
         })
     }
@@ -1592,7 +1599,8 @@ impl Config {
             || std::env::var("OPENCODE_ZEN_API_KEY").is_ok()
             || std::env::var("MINIMAX_API_KEY").is_ok()
             || std::env::var("MOONSHOT_API_KEY").is_ok()
-            || std::env::var("ZAI_CODING_PLAN_API_KEY").is_ok();
+            || std::env::var("ZAI_CODING_PLAN_API_KEY").is_ok()
+            || std::env::var("GOOGLE_ANTIGRAVITY_API_KEY").is_ok();
 
         // If we have any legacy keys, no onboarding needed
         if has_legacy_keys {
@@ -1657,6 +1665,7 @@ impl Config {
             minimax_key: std::env::var("MINIMAX_API_KEY").ok(),
             moonshot_key: std::env::var("MOONSHOT_API_KEY").ok(),
             zai_coding_plan_key: std::env::var("ZAI_CODING_PLAN_API_KEY").ok(),
+            google_antigravity_key: std::env::var("GOOGLE_ANTIGRAVITY_API_KEY").ok(),
             providers: HashMap::new(),
         };
 
@@ -1745,6 +1754,17 @@ impl Config {
                     api_type: ApiType::OpenAiCompletions,
                     base_url: MOONSHOT_PROVIDER_BASE_URL.to_string(),
                     api_key: moonshot_key,
+                    name: None,
+                });
+        }
+
+        if let Some(google_antigravity_key) = llm.google_antigravity_key.clone() {
+            llm.providers
+                .entry("google-antigravity".to_string())
+                .or_insert_with(|| ProviderConfig {
+                    api_type: ApiType::OpenAiCompletions,
+                    base_url: GOOGLE_ANTIGRAVITY_PROVIDER_BASE_URL.to_string(),
+                    api_key: google_antigravity_key,
                     name: None,
                 });
         }
@@ -1945,6 +1965,12 @@ impl Config {
                 .as_deref()
                 .and_then(resolve_env_value)
                 .or_else(|| std::env::var("ZAI_CODING_PLAN_API_KEY").ok()),
+            google_antigravity_key: toml
+                .llm
+                .google_antigravity_key
+                .as_deref()
+                .and_then(resolve_env_value)
+                .or_else(|| std::env::var("GOOGLE_ANTIGRAVITY_API_KEY").ok()),
             providers: toml
                 .llm
                 .providers
@@ -2048,6 +2074,17 @@ impl Config {
                     api_type: ApiType::OpenAiCompletions,
                     base_url: MOONSHOT_PROVIDER_BASE_URL.to_string(),
                     api_key: moonshot_key,
+                    name: None,
+                });
+        }
+
+        if let Some(google_antigravity_key) = llm.google_antigravity_key.clone() {
+            llm.providers
+                .entry("google-antigravity".to_string())
+                .or_insert_with(|| ProviderConfig {
+                    api_type: ApiType::OpenAiCompletions,
+                    base_url: GOOGLE_ANTIGRAVITY_PROVIDER_BASE_URL.to_string(),
+                    api_key: google_antigravity_key,
                     name: None,
                 });
         }
@@ -3039,19 +3076,31 @@ pub fn spawn_file_watcher(
                         // Discord: start if enabled and not already running
                         if let Some(discord_config) = &config.messaging.discord {
                             if discord_config.enabled && !manager.has_adapter("discord").await {
-                                let perms = match discord_permissions {
-                                    Some(ref existing) => existing.clone(),
-                                    None => {
-                                        let perms = DiscordPermissions::from_config(discord_config, &config.bindings);
-                                        Arc::new(arc_swap::ArcSwap::from_pointee(perms))
+                                #[cfg(feature = "discord")]
+                                {
+                                    let perms = match discord_permissions {
+                                        Some(ref existing) => existing.clone(),
+                                        None => {
+                                            let perms = DiscordPermissions::from_config(
+                                                discord_config,
+                                                &config.bindings,
+                                            );
+                                            Arc::new(arc_swap::ArcSwap::from_pointee(perms))
+                                        }
+                                    };
+                                    let adapter = crate::messaging::discord::DiscordAdapter::new(
+                                        &discord_config.token,
+                                        perms,
+                                    );
+                                    if let Err(error) = manager.register_and_start(adapter).await {
+                                        tracing::error!(%error, "failed to hot-start discord adapter from config change");
                                     }
-                                };
-                                let adapter = crate::messaging::discord::DiscordAdapter::new(
-                                    &discord_config.token,
-                                    perms,
-                                );
-                                if let Err(error) = manager.register_and_start(adapter).await {
-                                    tracing::error!(%error, "failed to hot-start discord adapter from config change");
+                                }
+                                #[cfg(not(feature = "discord"))]
+                                {
+                                    tracing::warn!(
+                                        "discord is enabled in config, but this binary was built without the `discord` feature"
+                                    );
                                 }
                             }
                         }
@@ -3059,27 +3108,39 @@ pub fn spawn_file_watcher(
                         // Slack: start if enabled and not already running
                         if let Some(slack_config) = &config.messaging.slack {
                             if slack_config.enabled && !manager.has_adapter("slack").await {
-                                let perms = match slack_permissions {
-                                    Some(ref existing) => existing.clone(),
-                                    None => {
-                                        let perms = SlackPermissions::from_config(slack_config, &config.bindings);
-                                        Arc::new(arc_swap::ArcSwap::from_pointee(perms))
-                                    }
-                                };
-                                match crate::messaging::slack::SlackAdapter::new(
-                                    &slack_config.bot_token,
-                                    &slack_config.app_token,
-                                    perms,
-                                    slack_config.commands.clone(),
-                                ) {
-                                    Ok(adapter) => {
-                                        if let Err(error) = manager.register_and_start(adapter).await {
-                                            tracing::error!(%error, "failed to hot-start slack adapter from config change");
+                                #[cfg(feature = "slack")]
+                                {
+                                    let perms = match slack_permissions {
+                                        Some(ref existing) => existing.clone(),
+                                        None => {
+                                            let perms = SlackPermissions::from_config(
+                                                slack_config,
+                                                &config.bindings,
+                                            );
+                                            Arc::new(arc_swap::ArcSwap::from_pointee(perms))
+                                        }
+                                    };
+                                    match crate::messaging::slack::SlackAdapter::new(
+                                        &slack_config.bot_token,
+                                        &slack_config.app_token,
+                                        perms,
+                                        slack_config.commands.clone(),
+                                    ) {
+                                        Ok(adapter) => {
+                                            if let Err(error) = manager.register_and_start(adapter).await {
+                                                tracing::error!(%error, "failed to hot-start slack adapter from config change");
+                                            }
+                                        }
+                                        Err(error) => {
+                                            tracing::error!(%error, "failed to build slack adapter from config change");
                                         }
                                     }
-                                    Err(error) => {
-                                        tracing::error!(%error, "failed to build slack adapter from config change");
-                                    }
+                                }
+                                #[cfg(not(feature = "slack"))]
+                                {
+                                    tracing::warn!(
+                                        "slack is enabled in config, but this binary was built without the `slack` feature"
+                                    );
                                 }
                             }
                         }
@@ -3107,22 +3168,34 @@ pub fn spawn_file_watcher(
                         // Twitch: start if enabled and not already running
                         if let Some(twitch_config) = &config.messaging.twitch {
                             if twitch_config.enabled && !manager.has_adapter("twitch").await {
-                                let perms = match twitch_permissions {
-                                    Some(ref existing) => existing.clone(),
-                                    None => {
-                                        let perms = TwitchPermissions::from_config(twitch_config, &config.bindings);
-                                        Arc::new(arc_swap::ArcSwap::from_pointee(perms))
+                                #[cfg(feature = "twitch")]
+                                {
+                                    let perms = match twitch_permissions {
+                                        Some(ref existing) => existing.clone(),
+                                        None => {
+                                            let perms = TwitchPermissions::from_config(
+                                                twitch_config,
+                                                &config.bindings,
+                                            );
+                                            Arc::new(arc_swap::ArcSwap::from_pointee(perms))
+                                        }
+                                    };
+                                    let adapter = crate::messaging::twitch::TwitchAdapter::new(
+                                        &twitch_config.username,
+                                        &twitch_config.oauth_token,
+                                        twitch_config.channels.clone(),
+                                        twitch_config.trigger_prefix.clone(),
+                                        perms,
+                                    );
+                                    if let Err(error) = manager.register_and_start(adapter).await {
+                                        tracing::error!(%error, "failed to hot-start twitch adapter from config change");
                                     }
-                                };
-                                let adapter = crate::messaging::twitch::TwitchAdapter::new(
-                                    &twitch_config.username,
-                                    &twitch_config.oauth_token,
-                                    twitch_config.channels.clone(),
-                                    twitch_config.trigger_prefix.clone(),
-                                    perms,
-                                );
-                                if let Err(error) = manager.register_and_start(adapter).await {
-                                    tracing::error!(%error, "failed to hot-start twitch adapter from config change");
+                                }
+                                #[cfg(not(feature = "twitch"))]
+                                {
+                                    tracing::warn!(
+                                        "twitch is enabled in config, but this binary was built without the `twitch` feature"
+                                    );
                                 }
                             }
                         }

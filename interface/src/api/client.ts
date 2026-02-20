@@ -655,6 +655,7 @@ export interface ProviderStatus {
 	minimax: boolean;
 	moonshot: boolean;
 	zai_coding_plan: boolean;
+	google_antigravity: boolean;
 }
 
 export interface ProvidersResponse {
@@ -673,6 +674,19 @@ export interface ProviderModelTestResponse {
 	provider: string;
 	model: string;
 	sample: string | null;
+}
+
+export interface GoogleAntigravityOAuthStartResponse {
+	auth_url: string;
+	state: string;
+}
+
+export interface GoogleAntigravityOAuthStatusResponse {
+	status: "pending" | "success" | "error" | "not_found";
+	message: string;
+	api_key: string | null;
+	email: string | null;
+	project_id: string | null;
 }
 
 // -- Model Types --
@@ -1135,6 +1149,21 @@ export const api = {
 		}
 		return response.json() as Promise<ProviderActionResponse>;
 	},
+	startGoogleAntigravityOAuth: async (redirectBaseUrl?: string) => {
+		const response = await fetch(`${API_BASE}/providers/google-antigravity/oauth/start`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ redirect_base_url: redirectBaseUrl ?? null }),
+		});
+		if (!response.ok) {
+			throw new Error(`API error: ${response.status}`);
+		}
+		return response.json() as Promise<GoogleAntigravityOAuthStartResponse>;
+	},
+	googleAntigravityOAuthStatus: (state: string) =>
+		fetchJson<GoogleAntigravityOAuthStatusResponse>(
+			`/providers/google-antigravity/oauth/status?state=${encodeURIComponent(state)}`,
+		),
 
 	// Model listing
 	models: (provider?: string) => {

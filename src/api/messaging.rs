@@ -302,67 +302,89 @@ pub(super) async fn toggle_platform(
                 match platform.as_str() {
                     "discord" => {
                         if let Some(discord_config) = &new_config.messaging.discord {
-                            let perms = {
-                                let perms_guard = state.discord_permissions.read().await;
-                                match perms_guard.as_ref() {
-                                    Some(existing) => existing.clone(),
-                                    None => {
-                                        drop(perms_guard);
-                                        let perms = crate::config::DiscordPermissions::from_config(
-                                            discord_config,
-                                            &new_config.bindings,
-                                        );
-                                        let arc_swap = std::sync::Arc::new(
-                                            arc_swap::ArcSwap::from_pointee(perms),
-                                        );
-                                        state.set_discord_permissions(arc_swap.clone()).await;
-                                        arc_swap
+                            #[cfg(feature = "discord")]
+                            {
+                                let perms = {
+                                    let perms_guard = state.discord_permissions.read().await;
+                                    match perms_guard.as_ref() {
+                                        Some(existing) => existing.clone(),
+                                        None => {
+                                            drop(perms_guard);
+                                            let perms =
+                                                crate::config::DiscordPermissions::from_config(
+                                                    discord_config,
+                                                    &new_config.bindings,
+                                                );
+                                            let arc_swap = std::sync::Arc::new(
+                                                arc_swap::ArcSwap::from_pointee(perms),
+                                            );
+                                            state.set_discord_permissions(arc_swap.clone()).await;
+                                            arc_swap
+                                        }
                                     }
+                                };
+                                let adapter = crate::messaging::discord::DiscordAdapter::new(
+                                    &discord_config.token,
+                                    perms,
+                                );
+                                if let Err(error) = manager.register_and_start(adapter).await {
+                                    tracing::error!(%error, "failed to start discord adapter on toggle");
                                 }
-                            };
-                            let adapter = crate::messaging::discord::DiscordAdapter::new(
-                                &discord_config.token,
-                                perms,
-                            );
-                            if let Err(error) = manager.register_and_start(adapter).await {
-                                tracing::error!(%error, "failed to start discord adapter on toggle");
+                            }
+                            #[cfg(not(feature = "discord"))]
+                            {
+                                tracing::warn!(
+                                    "discord is enabled in config, but this binary was built without the `discord` feature"
+                                );
                             }
                         }
                     }
                     "slack" => {
                         if let Some(slack_config) = &new_config.messaging.slack {
-                            let perms = {
-                                let perms_guard = state.slack_permissions.read().await;
-                                match perms_guard.as_ref() {
-                                    Some(existing) => existing.clone(),
-                                    None => {
-                                        drop(perms_guard);
-                                        let perms = crate::config::SlackPermissions::from_config(
-                                            slack_config,
-                                            &new_config.bindings,
-                                        );
-                                        let arc_swap = std::sync::Arc::new(
-                                            arc_swap::ArcSwap::from_pointee(perms),
-                                        );
-                                        state.set_slack_permissions(arc_swap.clone()).await;
-                                        arc_swap
+                            #[cfg(feature = "slack")]
+                            {
+                                let perms = {
+                                    let perms_guard = state.slack_permissions.read().await;
+                                    match perms_guard.as_ref() {
+                                        Some(existing) => existing.clone(),
+                                        None => {
+                                            drop(perms_guard);
+                                            let perms =
+                                                crate::config::SlackPermissions::from_config(
+                                                    slack_config,
+                                                    &new_config.bindings,
+                                                );
+                                            let arc_swap = std::sync::Arc::new(
+                                                arc_swap::ArcSwap::from_pointee(perms),
+                                            );
+                                            state.set_slack_permissions(arc_swap.clone()).await;
+                                            arc_swap
+                                        }
+                                    }
+                                };
+                                match crate::messaging::slack::SlackAdapter::new(
+                                    &slack_config.bot_token,
+                                    &slack_config.app_token,
+                                    perms,
+                                    slack_config.commands.clone(),
+                                ) {
+                                    Ok(adapter) => {
+                                        if let Err(error) =
+                                            manager.register_and_start(adapter).await
+                                        {
+                                            tracing::error!(%error, "failed to start slack adapter on toggle");
+                                        }
+                                    }
+                                    Err(error) => {
+                                        tracing::error!(%error, "failed to build slack adapter on toggle");
                                     }
                                 }
-                            };
-                            match crate::messaging::slack::SlackAdapter::new(
-                                &slack_config.bot_token,
-                                &slack_config.app_token,
-                                perms,
-                                slack_config.commands.clone(),
-                            ) {
-                                Ok(adapter) => {
-                                    if let Err(error) = manager.register_and_start(adapter).await {
-                                        tracing::error!(%error, "failed to start slack adapter on toggle");
-                                    }
-                                }
-                                Err(error) => {
-                                    tracing::error!(%error, "failed to build slack adapter on toggle");
-                                }
+                            }
+                            #[cfg(not(feature = "slack"))]
+                            {
+                                tracing::warn!(
+                                    "slack is enabled in config, but this binary was built without the `slack` feature"
+                                );
                             }
                         }
                     }
@@ -396,21 +418,30 @@ pub(super) async fn toggle_platform(
                     }
                     "twitch" => {
                         if let Some(twitch_config) = &new_config.messaging.twitch {
-                            let perms = crate::config::TwitchPermissions::from_config(
-                                twitch_config,
-                                &new_config.bindings,
-                            );
-                            let arc_swap =
-                                std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(perms));
-                            let adapter = crate::messaging::twitch::TwitchAdapter::new(
-                                &twitch_config.username,
-                                &twitch_config.oauth_token,
-                                twitch_config.channels.clone(),
-                                twitch_config.trigger_prefix.clone(),
-                                arc_swap,
-                            );
-                            if let Err(error) = manager.register_and_start(adapter).await {
-                                tracing::error!(%error, "failed to start twitch adapter on toggle");
+                            #[cfg(feature = "twitch")]
+                            {
+                                let perms = crate::config::TwitchPermissions::from_config(
+                                    twitch_config,
+                                    &new_config.bindings,
+                                );
+                                let arc_swap =
+                                    std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(perms));
+                                let adapter = crate::messaging::twitch::TwitchAdapter::new(
+                                    &twitch_config.username,
+                                    &twitch_config.oauth_token,
+                                    twitch_config.channels.clone(),
+                                    twitch_config.trigger_prefix.clone(),
+                                    arc_swap,
+                                );
+                                if let Err(error) = manager.register_and_start(adapter).await {
+                                    tracing::error!(%error, "failed to start twitch adapter on toggle");
+                                }
+                            }
+                            #[cfg(not(feature = "twitch"))]
+                            {
+                                tracing::warn!(
+                                    "twitch is enabled in config, but this binary was built without the `twitch` feature"
+                                );
                             }
                         }
                     }

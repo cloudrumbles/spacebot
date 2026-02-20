@@ -1,13 +1,16 @@
 use super::state::ApiState;
 
+use anyhow::Context as _;
 use axum::Json;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::sync::Arc;
+use sha2::Digest as _;
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
+use std::sync::{Arc, LazyLock};
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Clone, Debug)]
 pub(super) struct ModelInfo {
     /// Full routing string (e.g. "openrouter/anthropic/claude-sonnet-4")
     id: String,
@@ -69,12 +72,78 @@ struct ModelsDevModalities {
     output: Option<Vec<String>>,
 }
 
+#[derive(Clone, Debug)]
+struct CachedGoogleAntigravityModels {
+    key_hash: String,
+    models: Vec<ModelInfo>,
+    fetched_at: std::time::Instant,
+}
+
+#[derive(Debug, Deserialize)]
+struct GoogleAntigravityApiKeyPayload {
+    #[serde(default, alias = "accessToken", alias = "access_token")]
+    token: String,
+    #[serde(default, alias = "project_id")]
+    #[serde(rename = "projectId")]
+    project_id: String,
+    #[serde(default, alias = "refresh_token")]
+    #[serde(rename = "refreshToken")]
+    refresh_token: String,
+    #[serde(default, alias = "expires_at")]
+    #[serde(rename = "expiresAt")]
+    expires_at: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GoogleAntigravityFetchModelsResponse {
+    #[serde(default)]
+    models: HashMap<String, GoogleAntigravityModel>,
+    #[serde(default)]
+    #[serde(rename = "defaultAgentModelId")]
+    default_agent_model_id: Option<String>,
+    #[serde(default)]
+    #[serde(rename = "deprecatedModelIds")]
+    deprecated_model_ids: HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GoogleAntigravityModel {
+    #[serde(default)]
+    #[serde(rename = "displayName")]
+    display_name: Option<String>,
+    #[serde(default)]
+    #[serde(rename = "supportsThinking")]
+    supports_thinking: bool,
+    #[serde(default)]
+    #[serde(rename = "maxTokens")]
+    max_tokens: Option<u64>,
+    #[serde(default)]
+    #[serde(rename = "maxOutputTokens")]
+    max_output_tokens: Option<u64>,
+    #[serde(default)]
+    #[serde(rename = "isInternal")]
+    is_internal: bool,
+}
+
 /// Cached model catalog fetched from models.dev.
 static MODELS_CACHE: std::sync::LazyLock<
     tokio::sync::RwLock<(Vec<ModelInfo>, std::time::Instant)>,
 > = std::sync::LazyLock::new(|| tokio::sync::RwLock::new((Vec::new(), std::time::Instant::now())));
 
+static GOOGLE_ANTIGRAVITY_MODELS_CACHE: std::sync::LazyLock<
+    tokio::sync::RwLock<Option<CachedGoogleAntigravityModels>>,
+> = std::sync::LazyLock::new(|| tokio::sync::RwLock::new(None));
+
 const MODELS_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
+const GOOGLE_ANTIGRAVITY_MODELS_CACHE_TTL: std::time::Duration =
+    std::time::Duration::from_secs(300);
+const GOOGLE_ANTIGRAVITY_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
+static GOOGLE_ANTIGRAVITY_CLIENT_ID: LazyLock<String> =
+    LazyLock::new(|| std::env::var("GOOGLE_ANTIGRAVITY_CLIENT_ID").unwrap_or_default());
+static GOOGLE_ANTIGRAVITY_CLIENT_SECRET: LazyLock<String> =
+    LazyLock::new(|| std::env::var("GOOGLE_ANTIGRAVITY_CLIENT_SECRET").unwrap_or_default());
+const GOOGLE_ANTIGRAVITY_DEFAULT_PROJECT_ID: &str = "rising-fact-p41fc";
+const GOOGLE_ANTIGRAVITY_VERSION_FALLBACK: &str = "1.18.3";
 
 /// Maps models.dev provider IDs to spacebot's internal provider IDs for
 /// providers with direct integrations.
@@ -290,6 +359,342 @@ async fn ensure_models_cache() -> Vec<ModelInfo> {
     }
 }
 
+fn antigravity_models_cache_key(raw_api_key: &str) -> String {
+    let digest = sha2::Sha256::digest(raw_api_key.as_bytes());
+    format!("{digest:x}")
+}
+
+fn normalize_google_antigravity_expires_at_ms(expires_at: Option<i64>) -> Option<i64> {
+    expires_at.map(|value| {
+        if value < 10_000_000_000 {
+            value.saturating_mul(1000)
+        } else {
+            value
+        }
+    })
+}
+
+fn parse_google_antigravity_api_key_payload(raw_api_key: &str) -> GoogleAntigravityApiKeyPayload {
+    let trimmed = raw_api_key.trim();
+    if trimmed.is_empty() {
+        return GoogleAntigravityApiKeyPayload {
+            token: String::new(),
+            project_id: GOOGLE_ANTIGRAVITY_DEFAULT_PROJECT_ID.to_string(),
+            refresh_token: String::new(),
+            expires_at: None,
+        };
+    }
+
+    if let Ok(mut payload) = serde_json::from_str::<GoogleAntigravityApiKeyPayload>(trimmed) {
+        if payload.project_id.trim().is_empty() {
+            payload.project_id = GOOGLE_ANTIGRAVITY_DEFAULT_PROJECT_ID.to_string();
+        }
+        return payload;
+    }
+
+    GoogleAntigravityApiKeyPayload {
+        token: trimmed.to_string(),
+        project_id: GOOGLE_ANTIGRAVITY_DEFAULT_PROJECT_ID.to_string(),
+        refresh_token: String::new(),
+        expires_at: None,
+    }
+}
+
+fn resolve_toml_string_value(doc: &toml_edit::DocumentMut, key: &str) -> Option<String> {
+    let value = doc
+        .get("llm")
+        .and_then(|llm| llm.get(key))
+        .and_then(|value| value.as_str())?;
+
+    if let Some(variable_name) = value.strip_prefix("env:") {
+        return std::env::var(variable_name).ok();
+    }
+
+    if value.trim().is_empty() {
+        return None;
+    }
+
+    Some(value.to_string())
+}
+
+async fn google_antigravity_api_key_from_config(config_path: &Path) -> Option<String> {
+    let config_api_key = match tokio::fs::read_to_string(config_path).await {
+        Ok(content) => content
+            .parse::<toml_edit::DocumentMut>()
+            .ok()
+            .and_then(|doc| resolve_toml_string_value(&doc, "google_antigravity_key")),
+        Err(_) => None,
+    };
+
+    config_api_key.or_else(|| std::env::var("GOOGLE_ANTIGRAVITY_API_KEY").ok())
+}
+
+async fn google_antigravity_access_token(
+    client: &reqwest::Client,
+    credentials: &GoogleAntigravityApiKeyPayload,
+) -> anyhow::Result<String> {
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let expires_at_ms = normalize_google_antigravity_expires_at_ms(credentials.expires_at);
+    let inline_token = credentials.token.trim();
+
+    if !inline_token.is_empty() {
+        if let Some(expires_at_ms) = expires_at_ms {
+            if expires_at_ms > now_ms + 60_000 {
+                return Ok(inline_token.to_string());
+            }
+        } else {
+            return Ok(inline_token.to_string());
+        }
+    }
+
+    if credentials.refresh_token.trim().is_empty() {
+        anyhow::bail!(
+            "Google Antigravity credentials are missing both a valid access token and refresh token"
+        )
+    }
+    if GOOGLE_ANTIGRAVITY_CLIENT_ID.is_empty() || GOOGLE_ANTIGRAVITY_CLIENT_SECRET.is_empty() {
+        anyhow::bail!(
+            "Google Antigravity OAuth client credentials are not configured. \
+Set GOOGLE_ANTIGRAVITY_CLIENT_ID and GOOGLE_ANTIGRAVITY_CLIENT_SECRET."
+        )
+    }
+
+    let token_response = client
+        .post(GOOGLE_ANTIGRAVITY_TOKEN_URL)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .form(&[
+            ("client_id", GOOGLE_ANTIGRAVITY_CLIENT_ID.as_str()),
+            ("client_secret", GOOGLE_ANTIGRAVITY_CLIENT_SECRET.as_str()),
+            ("refresh_token", credentials.refresh_token.as_str()),
+            ("grant_type", "refresh_token"),
+        ])
+        .send()
+        .await
+        .context("Google Antigravity token refresh request failed")?;
+
+    let status = token_response.status();
+    let response_text = token_response
+        .text()
+        .await
+        .context("failed to read Google Antigravity token refresh response")?;
+    let response_body: serde_json::Value = serde_json::from_str(&response_text)
+        .context("Google Antigravity token refresh response is not valid JSON")?;
+
+    if !status.is_success() {
+        let error_message = response_body["error_description"]
+            .as_str()
+            .or_else(|| response_body["error"]["message"].as_str())
+            .or_else(|| response_body["error"].as_str())
+            .unwrap_or("unknown error");
+        anyhow::bail!("Google Antigravity token refresh failed ({status}): {error_message}");
+    }
+
+    let refreshed_token = response_body["access_token"]
+        .as_str()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if refreshed_token.is_empty() {
+        anyhow::bail!("Google Antigravity token refresh succeeded but returned no access_token");
+    }
+
+    Ok(refreshed_token)
+}
+
+fn humanize_google_antigravity_model_id(model_id: &str) -> String {
+    model_id
+        .replace(['-', '_'], " ")
+        .split_whitespace()
+        .map(|word| {
+            let mut chars = word.chars();
+            match chars.next() {
+                Some(first) => format!("{}{}", first.to_ascii_uppercase(), chars.as_str()),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn should_include_google_antigravity_model(
+    model_id: &str,
+    model: &GoogleAntigravityModel,
+    deprecated_model_ids: &HashSet<String>,
+) -> bool {
+    if deprecated_model_ids.contains(model_id) {
+        return false;
+    }
+    if model.is_internal {
+        return false;
+    }
+    if model_id.starts_with("chat_") || model_id.starts_with("tab_") {
+        return false;
+    }
+    true
+}
+
+async fn fetch_google_antigravity_models_with_api_key(
+    raw_api_key: &str,
+) -> anyhow::Result<Vec<ModelInfo>> {
+    let credentials = parse_google_antigravity_api_key_payload(raw_api_key);
+    let client = reqwest::Client::new();
+    let access_token = google_antigravity_access_token(&client, &credentials).await?;
+    let project_id = if credentials.project_id.trim().is_empty() {
+        GOOGLE_ANTIGRAVITY_DEFAULT_PROJECT_ID.to_string()
+    } else {
+        credentials.project_id.trim().to_string()
+    };
+
+    let endpoints = [
+        "https://cloudcode-pa.googleapis.com",
+        "https://daily-cloudcode-pa.sandbox.googleapis.com",
+    ];
+    let mut errors = Vec::new();
+
+    for endpoint in endpoints {
+        let response = match client
+            .post(format!("{endpoint}/v1internal:fetchAvailableModels"))
+            .header("authorization", format!("Bearer {access_token}"))
+            .header("content-type", "application/json")
+            .header(
+                "user-agent",
+                format!("antigravity/{GOOGLE_ANTIGRAVITY_VERSION_FALLBACK} darwin/arm64"),
+            )
+            .json(&serde_json::json!({ "project": project_id }))
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                errors.push(format!(
+                    "fetchAvailableModels request failed at {endpoint}: {error}"
+                ));
+                continue;
+            }
+        };
+
+        let status = response.status();
+        let response_text = match response.text().await {
+            Ok(text) => text,
+            Err(error) => {
+                errors.push(format!(
+                    "failed to read fetchAvailableModels response body at {endpoint}: {error}"
+                ));
+                continue;
+            }
+        };
+
+        if !status.is_success() {
+            errors.push(format!(
+                "fetchAvailableModels failed ({status}) at {endpoint}: {}",
+                response_text.chars().take(200).collect::<String>()
+            ));
+            continue;
+        }
+
+        let body: GoogleAntigravityFetchModelsResponse = match serde_json::from_str(&response_text)
+        {
+            Ok(body) => body,
+            Err(error) => {
+                errors.push(format!(
+                    "fetchAvailableModels returned invalid JSON at {endpoint}: {error}"
+                ));
+                continue;
+            }
+        };
+
+        let deprecated_model_ids = body
+            .deprecated_model_ids
+            .keys()
+            .cloned()
+            .collect::<HashSet<_>>();
+        let default_model_id = body.default_agent_model_id.clone();
+
+        let mut models = Vec::new();
+        for (model_id, model) in body.models {
+            if !should_include_google_antigravity_model(&model_id, &model, &deprecated_model_ids) {
+                continue;
+            }
+
+            let display_name = model
+                .display_name
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or_else(|| humanize_google_antigravity_model_id(&model_id));
+            let reasoning = model.supports_thinking || model_id.contains("thinking");
+
+            models.push(ModelInfo {
+                id: format!("google-antigravity/{model_id}"),
+                name: display_name,
+                provider: "google-antigravity".to_string(),
+                context_window: model.max_tokens.or(model.max_output_tokens),
+                tool_call: true,
+                reasoning,
+            });
+        }
+
+        let default_routing_id =
+            default_model_id.map(|model_id| format!("google-antigravity/{model_id}"));
+        models.sort_by(|left, right| {
+            let left_is_default = default_routing_id.as_ref().is_some_and(|id| left.id == *id);
+            let right_is_default = default_routing_id
+                .as_ref()
+                .is_some_and(|id| right.id == *id);
+            right_is_default
+                .cmp(&left_is_default)
+                .then(left.name.cmp(&right.name))
+        });
+
+        return Ok(models);
+    }
+
+    anyhow::bail!(
+        "failed to fetch Google Antigravity models: {}",
+        errors.join("; ")
+    );
+}
+
+async fn ensure_google_antigravity_models_cache(raw_api_key: &str) -> Vec<ModelInfo> {
+    let key_hash = antigravity_models_cache_key(raw_api_key);
+    {
+        let cache = GOOGLE_ANTIGRAVITY_MODELS_CACHE.read().await;
+        if let Some(entry) = cache.as_ref() {
+            if entry.key_hash == key_hash
+                && entry.fetched_at.elapsed() < GOOGLE_ANTIGRAVITY_MODELS_CACHE_TTL
+            {
+                return entry.models.clone();
+            }
+        }
+    }
+
+    let stale_models = {
+        let cache = GOOGLE_ANTIGRAVITY_MODELS_CACHE.read().await;
+        cache
+            .as_ref()
+            .filter(|entry| entry.key_hash == key_hash)
+            .map(|entry| entry.models.clone())
+            .unwrap_or_default()
+    };
+
+    match fetch_google_antigravity_models_with_api_key(raw_api_key).await {
+        Ok(models) => {
+            let mut cache = GOOGLE_ANTIGRAVITY_MODELS_CACHE.write().await;
+            *cache = Some(CachedGoogleAntigravityModels {
+                key_hash,
+                models: models.clone(),
+                fetched_at: std::time::Instant::now(),
+            });
+            models
+        }
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "failed to fetch Google Antigravity models, using stale cache"
+            );
+            stale_models
+        }
+    }
+}
+
 /// Helper: which providers have keys configured.
 pub(super) async fn configured_providers(config_path: &std::path::Path) -> Vec<&'static str> {
     let mut providers = Vec::new();
@@ -359,6 +764,9 @@ pub(super) async fn configured_providers(config_path: &std::path::Path) -> Vec<&
     if has_key("zai_coding_plan_key", "ZAI_CODING_PLAN_API_KEY") {
         providers.push("zai-coding-plan");
     }
+    if has_key("google_antigravity_key", "GOOGLE_ANTIGRAVITY_API_KEY") {
+        providers.push("google-antigravity");
+    }
 
     providers
 }
@@ -397,6 +805,26 @@ pub(super) async fn get_models(
             models.push(model);
         }
     }
+
+    let should_include_google_antigravity = match requested_provider {
+        Some(provider) => provider == "google-antigravity",
+        None => configured.contains(&"google-antigravity"),
+    };
+
+    if should_include_google_antigravity {
+        if let Some(raw_api_key) = google_antigravity_api_key_from_config(&config_path).await {
+            let antigravity_models = ensure_google_antigravity_models_cache(&raw_api_key).await;
+            models.extend(antigravity_models);
+        }
+    }
+
+    models.sort_by(|left, right| left.id.cmp(&right.id));
+    models.dedup_by(|left, right| left.id == right.id);
+    models.sort_by(|left, right| {
+        left.provider
+            .cmp(&right.provider)
+            .then(left.name.cmp(&right.name))
+    });
 
     Ok(Json(ModelsResponse { models }))
 }

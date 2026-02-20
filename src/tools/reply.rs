@@ -54,6 +54,7 @@ pub struct ReplyError(String);
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ReplyArgs {
     /// The message content to send to the user.
+    #[serde(alias = "message")]
     pub content: String,
     /// Optional: create a new thread with this name and reply inside it.
     /// When set, a public thread is created in the current channel and the
@@ -170,6 +171,10 @@ impl Tool for ReplyTool {
                     "type": "string",
                     "description": "The content to send to the user. Can be markdown formatted."
                 },
+                "message": {
+                    "type": "string",
+                    "description": "Legacy alias for content. Either content or message is accepted."
+                },
                 "thread_name": {
                     "type": "string",
                     "description": "If provided, creates a new public thread with this name and posts the reply inside it. Max 100 characters."
@@ -259,7 +264,10 @@ impl Tool for ReplyTool {
                     "required": ["question", "answers"]
                 }
             },
-            "required": ["content"]
+            "anyOf": [
+                { "required": ["content"] },
+                { "required": ["message"] }
+            ]
         });
 
         ToolDefinition {

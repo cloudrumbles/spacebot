@@ -73,6 +73,14 @@ const PROVIDERS = [
 		defaultModel: "openrouter/anthropic/claude-sonnet-4",
 	},
 	{
+		id: "google-antigravity",
+		name: "Google Antigravity",
+		description: "Cloud Code Assist models via Google OAuth (Gemini + Claude)",
+		placeholder: "",
+		envVar: "GOOGLE_ANTIGRAVITY_API_KEY",
+		defaultModel: "google-antigravity/claude-opus-4-6-thinking",
+	},
+	{
 		id: "opencode-zen",
 		name: "OpenCode Zen",
 		description: "Multi-format gateway (Kimi, GLM, MiniMax, Qwen)",
@@ -224,6 +232,8 @@ export function Settings() {
 		text: string;
 		type: "success" | "error";
 	} | null>(null);
+	const [googleOAuthPending, setGoogleOAuthPending] = useState(false);
+	const googleOAuthPollTokenRef = useRef(0);
 
 	// Fetch providers data (only when on providers tab)
 	const {data, isLoading} = useQuery({
@@ -288,6 +298,8 @@ export function Settings() {
 	});
 
 	const editingProviderData = PROVIDERS.find((p) => p.id === editingProvider);
+	const isGoogleAntigravity = editingProvider === "google-antigravity";
+	const isOllama = editingProvider === "ollama";
 
 	const currentSignature = `${editingProvider ?? ""}|${keyInput.trim()}|${modelInput.trim()}`;
 
@@ -319,7 +331,7 @@ export function Settings() {
 	const handleSave = async () => {
 		if (!keyInput.trim() || !editingProvider || !modelInput.trim()) return;
 
-		if (testedSignature !== currentSignature) {
+		if (editingProvider !== "google-antigravity" && testedSignature !== currentSignature) {
 			const testPassed = await handleTestModel();
 			if (!testPassed) return;
 		}
@@ -331,7 +343,92 @@ export function Settings() {
 		});
 	};
 
+	const cancelGoogleOAuthPolling = () => {
+		googleOAuthPollTokenRef.current += 1;
+		setGoogleOAuthPending(false);
+	};
+
+	const handleStartGoogleAntigravityOAuth = async () => {
+		if (googleOAuthPending) return;
+		setMessage(null);
+		setTestResult(null);
+		setTestedSignature(null);
+		const pollToken = ++googleOAuthPollTokenRef.current;
+		setGoogleOAuthPending(true);
+
+		try {
+			const start = await api.startGoogleAntigravityOAuth(window.location.origin);
+			const popup = window.open(
+				start.auth_url,
+				"google-antigravity-oauth",
+				"width=560,height=760,noopener,noreferrer",
+			);
+			if (!popup) {
+				cancelGoogleOAuthPolling();
+				setMessage({
+					text: "Popup blocked. Allow popups for this site and retry.",
+					type: "error",
+				});
+				return;
+			}
+
+			const startedAt = Date.now();
+			const poll = async () => {
+				if (googleOAuthPollTokenRef.current !== pollToken) return;
+				if (Date.now() - startedAt > 10 * 60 * 1000) {
+					cancelGoogleOAuthPolling();
+					setMessage({
+						text: "Google OAuth timed out. Start the flow again.",
+						type: "error",
+					});
+					return;
+				}
+
+				try {
+					const status = await api.googleAntigravityOAuthStatus(start.state);
+					if (googleOAuthPollTokenRef.current !== pollToken) return;
+
+					if (status.status === "pending") {
+						window.setTimeout(poll, 1200);
+						return;
+					}
+
+					if (status.status === "success" && status.api_key) {
+						setKeyInput(status.api_key);
+						cancelGoogleOAuthPolling();
+						if (!popup.closed) popup.close();
+						setMessage({
+							text: status.email
+								? `Google authentication complete (${status.email}).`
+								: "Google authentication complete.",
+							type: "success",
+						});
+						return;
+					}
+
+					cancelGoogleOAuthPolling();
+					setMessage({
+						text: status.message || "Google authentication failed.",
+						type: "error",
+					});
+				} catch (error: any) {
+					cancelGoogleOAuthPolling();
+					setMessage({
+						text: `Google OAuth status check failed: ${error.message}`,
+						type: "error",
+					});
+				}
+			};
+
+			poll();
+		} catch (error: any) {
+			cancelGoogleOAuthPolling();
+			setMessage({text: `Failed to start Google OAuth: ${error.message}`, type: "error"});
+		}
+	};
+
 	const handleClose = () => {
+		cancelGoogleOAuthPolling();
 		setEditingProvider(null);
 		setKeyInput("");
 		setModelInput("");
@@ -411,6 +508,7 @@ export function Settings() {
 										configured={isConfigured(provider.id)}
 										defaultModel={provider.defaultModel}
 										onEdit={() => {
+									cancelGoogleOAuthPolling();
 									setEditingProvider(provider.id);
 									setKeyInput("");
 									setModelInput(provider.defaultModel ?? "");
@@ -462,27 +560,50 @@ export function Settings() {
 					<DialogHeader>
 						<DialogTitle>
 							{isConfigured(editingProvider ?? "") ? "Update" : "Add"}{" "}
-							{editingProvider === "ollama" ? "Endpoint" : "API Key"}
+							{isGoogleAntigravity ? "OAuth Connection" : isOllama ? "Endpoint" : "API Key"}
 						</DialogTitle>
 						<DialogDescription>
-							{editingProvider === "ollama"
+							{isGoogleAntigravity
+								? `Authenticate ${editingProviderData?.name} with Google OAuth.`
+								: isOllama
 								? `Enter your ${editingProviderData?.name} base URL. It will be saved to your instance config.`
 								: `Enter your ${editingProviderData?.name} API key. It will be saved to your instance config.`}
 						</DialogDescription>
 					</DialogHeader>
-					<Input
-						type={editingProvider === "ollama" ? "text" : "password"}
-						value={keyInput}
-						onChange={(e) => {
-							setKeyInput(e.target.value);
-							setTestedSignature(null);
-						}}
-						placeholder={editingProviderData?.placeholder}
-						autoFocus
-						onKeyDown={(e) => {
-							if (e.key === "Enter") handleSave();
-						}}
-					/>
+					{isGoogleAntigravity ? (
+						<div className="rounded-md border border-app-line bg-app-darkBox/20 p-3">
+							<div className="mb-2 text-sm text-ink-dull">
+								Connect once to generate an OAuth credential payload for this provider.
+							</div>
+							<div className="flex items-center gap-2">
+								<Button
+									onClick={handleStartGoogleAntigravityOAuth}
+									loading={googleOAuthPending}
+									variant="outline"
+									size="sm"
+								>
+									Connect with Google
+								</Button>
+								{keyInput.trim() && !googleOAuthPending ? (
+									<span className="text-xs text-green-400">Credential ready</span>
+								) : null}
+							</div>
+						</div>
+					) : (
+						<Input
+							type={isOllama ? "text" : "password"}
+							value={keyInput}
+							onChange={(e) => {
+								setKeyInput(e.target.value);
+								setTestedSignature(null);
+							}}
+							placeholder={editingProviderData?.placeholder}
+							autoFocus
+							onKeyDown={(e) => {
+								if (e.key === "Enter") handleSave();
+							}}
+						/>
+					)}
 					<ModelSelect
 						label="Model"
 						description="Pick the exact model ID to verify and apply to routing"
@@ -496,7 +617,7 @@ export function Settings() {
 					<div className="flex items-center gap-2">
 						<Button
 							onClick={handleTestModel}
-							disabled={!editingProvider || !keyInput.trim() || !modelInput.trim()}
+							disabled={!editingProvider || !keyInput.trim() || !modelInput.trim() || googleOAuthPending}
 							loading={testModelMutation.isPending}
 							variant="outline"
 							size="sm"
@@ -538,7 +659,7 @@ export function Settings() {
 						</Button>
 						<Button
 							onClick={handleSave}
-							disabled={!keyInput.trim() || !modelInput.trim()}
+							disabled={!keyInput.trim() || !modelInput.trim() || googleOAuthPending}
 							loading={updateMutation.isPending}
 							size="sm"
 						>

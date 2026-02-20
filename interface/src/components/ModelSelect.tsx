@@ -24,6 +24,7 @@ const PROVIDER_LABELS: Record<string, string> = {
   zhipu: "Z.ai (GLM)",
   ollama: "Ollama",
   "opencode-zen": "OpenCode Zen",
+  "google-antigravity": "Google Antigravity",
 };
 
 function formatContextWindow(tokens: number | null): string {
@@ -124,6 +125,7 @@ export function ModelSelect({
     "openrouter",
     "anthropic",
     "openai",
+    "google-antigravity",
     "ollama",
     "deepseek",
     "xai",

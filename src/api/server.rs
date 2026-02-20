@@ -97,6 +97,18 @@ pub async fn start_http_server(
         )
         .route("/providers/test", post(providers::test_provider_model))
         .route("/providers/{provider}", delete(providers::delete_provider))
+        .route(
+            "/providers/google-antigravity/oauth/start",
+            post(providers::start_google_antigravity_oauth),
+        )
+        .route(
+            "/providers/google-antigravity/oauth/status",
+            get(providers::google_antigravity_oauth_status),
+        )
+        .route(
+            "/providers/google-antigravity/oauth/callback",
+            get(providers::google_antigravity_oauth_callback),
+        )
         .route("/models", get(models::get_models))
         .route("/models/refresh", post(models::refresh_models))
         .route("/messaging/status", get(messaging::messaging_status))

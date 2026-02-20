@@ -85,11 +85,11 @@ daemonize = "0.5"
 libc = "0.2"
 
 # Discord
-serenity = { version = "0.12", default-features = false, features = ["client", "gateway", "model", "cache", "chrono", "rustls_backend"] }
+serenity = { version = "0.12", optional = true, default-features = false, features = ["client", "gateway", "model", "cache", "chrono", "rustls_backend"] }
 async-trait = "0.1"
 
 # Slack
-slack-morphism = { version = "2.17", features = ["hyper"] }
+slack-morphism = { version = "2.17", optional = true, features = ["hyper"] }
 
 # TLS (shared crypto backend for slack-morphism, reqwest, teloxide)
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
@@ -98,7 +98,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring"] }
 teloxide = { version = "0.17", default-features = false, features = ["rustls"] }
 
 # Twitch
-twitch-irc = { version = "5.0", default-features = false, features = ["transport-tcp-rustls-webpki-roots"] }
+twitch-irc = { version = "5.0", optional = true, default-features = false, features = ["transport-tcp-rustls-webpki-roots"] }
 
 # Stream utilities
 tokio-stream = "0.1"
@@ -137,6 +137,10 @@ prometheus = { version = "0.13", optional = true }
 pdf-extract = "0.10.0"
 
 [features]
+default = ["discord", "slack", "twitch"]
+discord = ["dep:serenity"]
+slack = ["dep:slack-morphism"]
+twitch = ["dep:twitch-irc"]
 metrics = ["dep:prometheus"]
 
 [lints.clippy]
@@ -148,5 +152,8 @@ unimplemented = "forbid"
 tokio-test = "0.4"
 
 [profile.release]
-lto = "thin"
-strip = true
+opt-level = 1
+lto = false
+codegen-units = 64
+incremental = true
+strip = false
