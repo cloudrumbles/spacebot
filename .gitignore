@@ -1,6 +1,9 @@
 /target
 .DS_Store
 .fastembed_cache
+.env
+.env.*
+!.env.example
 
 # Interface
 interface/node_modules/
