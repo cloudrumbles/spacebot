@@ -38,6 +38,13 @@ impl MessagingManager {
         self.adapters.write().await.insert(name, Arc::new(adapter));
     }
 
+    /// Register a pre-wrapped adapter that the caller retains a handle to.
+    pub async fn register_shared(&self, adapter: Arc<impl Messaging>) {
+        let name = adapter.name().to_string();
+        tracing::info!(adapter = %name, "registered messaging adapter (shared)");
+        self.adapters.write().await.insert(name, adapter);
+    }
+
     /// Start all registered adapters and return the merged inbound stream.
     ///
     /// Each adapter's stream is forwarded into a shared channel, so adapters
@@ -47,15 +54,23 @@ impl MessagingManager {
         for (name, adapter) in adapters.iter() {
             match adapter.start().await {
                 Ok(stream) => Self::spawn_forwarder(name.clone(), stream, self.fan_in_tx.clone()),
-                Err(error) => tracing::error!(adapter = %name, %error, "adapter failed to start, skipping"),
+                Err(error) => {
+                    tracing::error!(adapter = %name, %error, "adapter failed to start, skipping")
+                }
             }
         }
         drop(adapters);
 
-        let receiver = self.fan_in_rx.write().await.take()
+        let receiver = self
+            .fan_in_rx
+            .write()
+            .await
+            .take()
             .context("start() already called")?;
 
-        Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(receiver)))
+        Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(
+            receiver,
+        )))
     }
 
     /// Register and start a new adapter at runtime.
@@ -79,7 +94,9 @@ impl MessagingManager {
 
         let adapter: Arc<dyn MessagingDyn> = Arc::new(adapter);
 
-        let stream = adapter.start().await
+        let stream = adapter
+            .start()
+            .await
             .with_context(|| format!("failed to start adapter '{name}'"))?;
         Self::spawn_forwarder(name.clone(), stream, self.fan_in_tx.clone());
 
@@ -109,6 +126,14 @@ impl MessagingManager {
             }
             tracing::info!(adapter = %name, "adapter stream ended");
         });
+    }
+
+    /// Inject a message directly into the fan-in channel, bypassing adapter streams.
+    pub async fn inject_message(&self, message: InboundMessage) -> crate::Result<()> {
+        self.fan_in_tx
+            .send(message)
+            .await
+            .map_err(|_| crate::error::Error::Other(anyhow::anyhow!("fan-in channel closed")))
     }
 
     /// Route a response back to the correct adapter based on message source.

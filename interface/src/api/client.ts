@@ -208,10 +208,9 @@ export interface AgentsResponse {
 export interface CronJobInfo {
 	id: string;
 	prompt: string;
-	interval_secs: number;
+	schedule: string;
 	delivery_target: string;
 	enabled: boolean;
-	active_hours: [number, number] | null;
 }
 
 export interface AgentOverviewResponse {
@@ -598,10 +597,9 @@ export interface AgentConfigUpdateRequest {
 export interface CronJobWithStats {
 	id: string;
 	prompt: string;
-	interval_secs: number;
+	schedule: string;
 	delivery_target: string;
 	enabled: boolean;
-	active_hours: [number, number] | null;
 	success_count: number;
 	failure_count: number;
 	last_executed_at: string | null;
@@ -630,10 +628,8 @@ export interface CronActionResponse {
 export interface CreateCronRequest {
 	id: string;
 	prompt: string;
-	interval_secs: number;
+	schedule: string;
 	delivery_target: string;
-	active_start_hour?: number;
-	active_end_hour?: number;
 	enabled: boolean;
 }
 
@@ -653,7 +649,12 @@ export interface ProviderStatus {
 	deepseek: boolean;
 	xai: boolean;
 	mistral: boolean;
+	ollama: boolean;
 	opencode_zen: boolean;
+	nvidia: boolean;
+	minimax: boolean;
+	moonshot: boolean;
+	zai_coding_plan: boolean;
 }
 
 export interface ProvidersResponse {
@@ -666,6 +667,14 @@ export interface ProviderActionResponse {
 	message: string;
 }
 
+export interface ProviderModelTestResponse {
+	success: boolean;
+	message: string;
+	provider: string;
+	model: string;
+	sample: string | null;
+}
+
 // -- Model Types --
 
 export interface ModelInfo {
@@ -673,7 +682,8 @@ export interface ModelInfo {
 	name: string;
 	provider: string;
 	context_window: number | null;
-	curated: boolean;
+	tool_call: boolean;
+	reasoning: boolean;
 }
 
 export interface ModelsResponse {
@@ -774,6 +784,7 @@ export interface MessagingStatusResponse {
 	slack: PlatformStatus;
 	telegram: PlatformStatus;
 	webhook: PlatformStatus;
+	twitch: PlatformStatus;
 }
 
 export interface BindingInfo {
@@ -802,6 +813,8 @@ export interface CreateBindingRequest {
 		discord_token?: string;
 		slack_bot_token?: string;
 		slack_app_token?: string;
+		twitch_username?: string;
+		twitch_oauth_token?: string;
 	};
 }
 
@@ -994,6 +1007,17 @@ export const api = {
 		return response.json() as Promise<{ success: boolean; agent_id: string; message: string }>;
 	},
 
+	deleteAgent: async (agentId: string) => {
+		const params = new URLSearchParams({ agent_id: agentId });
+		const response = await fetch(`${API_BASE}/agents?${params}`, {
+			method: "DELETE",
+		});
+		if (!response.ok) {
+			throw new Error(`API error: ${response.status}`);
+		}
+		return response.json() as Promise<{ success: boolean; message: string }>;
+	},
+
 	agentConfig: (agentId: string) =>
 		fetchJson<AgentConfigResponse>(`/agents/config?agent_id=${encodeURIComponent(agentId)}`),
 	updateAgentConfig: async (request: AgentConfigUpdateRequest) => {
@@ -1080,16 +1104,27 @@ export const api = {
 
 	// Provider management
 	providers: () => fetchJson<ProvidersResponse>("/providers"),
-	updateProvider: async (provider: string, apiKey: string) => {
+	updateProvider: async (provider: string, apiKey: string, model: string) => {
 		const response = await fetch(`${API_BASE}/providers`, {
 			method: "PUT",
 			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify({ provider, api_key: apiKey }),
+			body: JSON.stringify({ provider, api_key: apiKey, model }),
 		});
 		if (!response.ok) {
 			throw new Error(`API error: ${response.status}`);
 		}
 		return response.json() as Promise<ProviderActionResponse>;
+	},
+	testProviderModel: async (provider: string, apiKey: string, model: string) => {
+		const response = await fetch(`${API_BASE}/providers/test`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ provider, api_key: apiKey, model }),
+		});
+		if (!response.ok) {
+			throw new Error(`API error: ${response.status}`);
+		}
+		return response.json() as Promise<ProviderModelTestResponse>;
 	},
 	removeProvider: async (provider: string) => {
 		const response = await fetch(`${API_BASE}/providers/${encodeURIComponent(provider)}`, {
@@ -1102,7 +1137,10 @@ export const api = {
 	},
 
 	// Model listing
-	models: () => fetchJson<ModelsResponse>("/models"),
+	models: (provider?: string) => {
+		const query = provider ? `?provider=${encodeURIComponent(provider)}` : "";
+		return fetchJson<ModelsResponse>(`/models${query}`);
+	},
 	refreshModels: async () => {
 		const response = await fetch(`${API_BASE}/models/refresh`, {
 			method: "POST",
@@ -1297,6 +1335,22 @@ export const api = {
 		fetchJson<RegistrySearchResponse>(
 			`/skills/registry/search?q=${encodeURIComponent(query)}&limit=${limit}`,
 		),
+
+	// Web Chat API
+	webChatSend: (agentId: string, sessionId: string, message: string, senderName?: string) =>
+		fetch(`${API_BASE}/webchat/send`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({
+				agent_id: agentId,
+				session_id: sessionId,
+				sender_name: senderName ?? "user",
+				message,
+			}),
+		}),
+
+	webChatHistory: (agentId: string, sessionId: string, limit = 100) =>
+		fetch(`${API_BASE}/webchat/history?agent_id=${encodeURIComponent(agentId)}&session_id=${encodeURIComponent(sessionId)}&limit=${limit}`),
 
 	eventsUrl: `${API_BASE}/events`,
 };

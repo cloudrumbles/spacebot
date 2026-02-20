@@ -8,6 +8,7 @@ use crate::cron::{CronStore, Scheduler};
 use crate::llm::LlmManager;
 use crate::memory::{EmbeddingModel, MemorySearch};
 use crate::messaging::MessagingManager;
+use crate::messaging::webchat::WebChatAdapter;
 use crate::prompts::PromptEngine;
 use crate::update::SharedUpdateStatus;
 use crate::{ProcessEvent, ProcessId};
@@ -19,7 +20,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::{broadcast, mpsc, RwLock};
+use tokio::sync::{RwLock, broadcast, mpsc};
 
 /// Summary of an agent's configuration, exposed via the API.
 #[derive(Debug, Clone, Serialize)]
@@ -84,6 +85,10 @@ pub struct ApiState {
     pub defaults_config: RwLock<Option<DefaultsConfig>>,
     /// Sender to register newly created agents with the main event loop.
     pub agent_tx: mpsc::Sender<crate::Agent>,
+    /// Sender to remove agents from the main event loop.
+    pub agent_remove_tx: mpsc::Sender<String>,
+    /// Shared webchat adapter for session management from API handlers.
+    pub webchat_adapter: ArcSwap<Option<Arc<WebChatAdapter>>>,
 }
 
 /// Events sent to SSE clients. Wraps ProcessEvents with agent context.
@@ -168,6 +173,7 @@ impl ApiState {
     pub fn new_with_provider_sender(
         provider_setup_tx: mpsc::Sender<crate::ProviderSetupEvent>,
         agent_tx: mpsc::Sender<crate::Agent>,
+        agent_remove_tx: mpsc::Sender<String>,
     ) -> Self {
         let (event_tx, _) = broadcast::channel(512);
         Self {
@@ -196,6 +202,8 @@ impl ApiState {
             prompt_engine: RwLock::new(None),
             defaults_config: RwLock::new(None),
             agent_tx,
+            agent_remove_tx,
+            webchat_adapter: ArcSwap::from_pointee(None),
         }
     }
 
@@ -213,10 +221,7 @@ impl ApiState {
 
     /// Remove a channel's status block when it's dropped.
     pub async fn unregister_channel_status(&self, channel_id: &str) {
-        self.channel_status_blocks
-            .write()
-            .await
-            .remove(channel_id);
+        self.channel_status_blocks.write().await.remove(channel_id);
     }
 
     /// Register a channel's state for API-driven cancellation.
@@ -243,65 +248,114 @@ impl ApiState {
                     Ok(event) => {
                         // Translate ProcessEvents into typed ApiEvents
                         match &event {
-                            ProcessEvent::WorkerStarted { worker_id, channel_id, task, .. } => {
-                                api_tx.send(ApiEvent::WorkerStarted {
-                                    agent_id: agent_id.clone(),
-                                    channel_id: channel_id.as_deref().map(|s| s.to_string()),
-                                    worker_id: worker_id.to_string(),
-                                    task: task.clone(),
-                                }).ok();
+                            ProcessEvent::WorkerStarted {
+                                worker_id,
+                                channel_id,
+                                task,
+                                ..
+                            } => {
+                                api_tx
+                                    .send(ApiEvent::WorkerStarted {
+                                        agent_id: agent_id.clone(),
+                                        channel_id: channel_id.as_deref().map(|s| s.to_string()),
+                                        worker_id: worker_id.to_string(),
+                                        task: task.clone(),
+                                    })
+                                    .ok();
                             }
-                            ProcessEvent::BranchStarted { branch_id, channel_id, description, .. } => {
-                                api_tx.send(ApiEvent::BranchStarted {
-                                    agent_id: agent_id.clone(),
-                                    channel_id: channel_id.to_string(),
-                                    branch_id: branch_id.to_string(),
-                                    description: description.clone(),
-                                }).ok();
+                            ProcessEvent::BranchStarted {
+                                branch_id,
+                                channel_id,
+                                description,
+                                ..
+                            } => {
+                                api_tx
+                                    .send(ApiEvent::BranchStarted {
+                                        agent_id: agent_id.clone(),
+                                        channel_id: channel_id.to_string(),
+                                        branch_id: branch_id.to_string(),
+                                        description: description.clone(),
+                                    })
+                                    .ok();
                             }
-                            ProcessEvent::WorkerStatus { worker_id, channel_id, status, .. } => {
-                                api_tx.send(ApiEvent::WorkerStatusUpdate {
-                                    agent_id: agent_id.clone(),
-                                    channel_id: channel_id.as_deref().map(|s| s.to_string()),
-                                    worker_id: worker_id.to_string(),
-                                    status: status.clone(),
-                                }).ok();
+                            ProcessEvent::WorkerStatus {
+                                worker_id,
+                                channel_id,
+                                status,
+                                ..
+                            } => {
+                                api_tx
+                                    .send(ApiEvent::WorkerStatusUpdate {
+                                        agent_id: agent_id.clone(),
+                                        channel_id: channel_id.as_deref().map(|s| s.to_string()),
+                                        worker_id: worker_id.to_string(),
+                                        status: status.clone(),
+                                    })
+                                    .ok();
                             }
-                            ProcessEvent::WorkerComplete { worker_id, channel_id, result, .. } => {
-                                api_tx.send(ApiEvent::WorkerCompleted {
-                                    agent_id: agent_id.clone(),
-                                    channel_id: channel_id.as_deref().map(|s| s.to_string()),
-                                    worker_id: worker_id.to_string(),
-                                    result: result.clone(),
-                                }).ok();
+                            ProcessEvent::WorkerComplete {
+                                worker_id,
+                                channel_id,
+                                result,
+                                ..
+                            } => {
+                                api_tx
+                                    .send(ApiEvent::WorkerCompleted {
+                                        agent_id: agent_id.clone(),
+                                        channel_id: channel_id.as_deref().map(|s| s.to_string()),
+                                        worker_id: worker_id.to_string(),
+                                        result: result.clone(),
+                                    })
+                                    .ok();
                             }
-                            ProcessEvent::BranchResult { branch_id, channel_id, conclusion, .. } => {
-                                api_tx.send(ApiEvent::BranchCompleted {
-                                    agent_id: agent_id.clone(),
-                                    channel_id: channel_id.to_string(),
-                                    branch_id: branch_id.to_string(),
-                                    conclusion: conclusion.clone(),
-                                }).ok();
+                            ProcessEvent::BranchResult {
+                                branch_id,
+                                channel_id,
+                                conclusion,
+                                ..
+                            } => {
+                                api_tx
+                                    .send(ApiEvent::BranchCompleted {
+                                        agent_id: agent_id.clone(),
+                                        channel_id: channel_id.to_string(),
+                                        branch_id: branch_id.to_string(),
+                                        conclusion: conclusion.clone(),
+                                    })
+                                    .ok();
                             }
-                            ProcessEvent::ToolStarted { process_id, channel_id, tool_name, .. } => {
+                            ProcessEvent::ToolStarted {
+                                process_id,
+                                channel_id,
+                                tool_name,
+                                ..
+                            } => {
                                 let (process_type, id_str) = process_id_info(process_id);
-                                api_tx.send(ApiEvent::ToolStarted {
-                                    agent_id: agent_id.clone(),
-                                    channel_id: channel_id.as_deref().map(|s| s.to_string()),
-                                    process_type,
-                                    process_id: id_str,
-                                    tool_name: tool_name.clone(),
-                                }).ok();
+                                api_tx
+                                    .send(ApiEvent::ToolStarted {
+                                        agent_id: agent_id.clone(),
+                                        channel_id: channel_id.as_deref().map(|s| s.to_string()),
+                                        process_type,
+                                        process_id: id_str,
+                                        tool_name: tool_name.clone(),
+                                    })
+                                    .ok();
                             }
-                            ProcessEvent::ToolCompleted { process_id, channel_id, tool_name, .. } => {
+                            ProcessEvent::ToolCompleted {
+                                process_id,
+                                channel_id,
+                                tool_name,
+                                ..
+                            } => {
                                 let (process_type, id_str) = process_id_info(process_id);
-                                api_tx.send(ApiEvent::ToolCompleted {
-                                    agent_id: agent_id.clone(),
-                                    channel_id: channel_id.as_deref().map(|s| s.to_string()),
-                                    process_type,
-                                    process_id: id_str,
-                                    tool_name: tool_name.clone(),
-                                }).ok();
+                                api_tx
+                                    .send(ApiEvent::ToolCompleted {
+                                        agent_id: agent_id.clone(),
+                                        channel_id: channel_id.as_deref().map(|s| s.to_string()),
+                                        process_type,
+                                        process_id: id_str,
+                                        tool_name: tool_name.clone(),
+                                    })
+                                    .ok();
                             }
                             _ => {}
                         }
@@ -404,6 +458,11 @@ impl ApiState {
     /// Set the instance-level defaults for runtime agent creation.
     pub async fn set_defaults_config(&self, defaults: DefaultsConfig) {
         *self.defaults_config.write().await = Some(defaults);
+    }
+
+    /// Set the shared webchat adapter for API handlers.
+    pub fn set_webchat_adapter(&self, adapter: Arc<WebChatAdapter>) {
+        self.webchat_adapter.store(Arc::new(Some(adapter)));
     }
 
     /// Send an event to all SSE subscribers.

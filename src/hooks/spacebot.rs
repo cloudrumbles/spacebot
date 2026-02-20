@@ -63,7 +63,8 @@ impl SpacebotHook {
                 // Google API keys
                 Regex::new(r"AIza[0-9A-Za-z_-]{35}").expect("hardcoded regex"),
                 // Discord bot tokens (base64 user ID . timestamp . HMAC)
-                Regex::new(r"[MN][A-Za-z0-9]{23,}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{27,}").expect("hardcoded regex"),
+                Regex::new(r"[MN][A-Za-z0-9]{23,}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{27,}")
+                    .expect("hardcoded regex"),
                 // Slack bot tokens
                 Regex::new(r"xoxb-[0-9]{10,}-[0-9A-Za-z-]+").expect("hardcoded regex"),
                 // Slack app tokens
@@ -85,15 +86,20 @@ impl SpacebotHook {
     }
 }
 
+// Timer map for tool call duration measurement. Entries are inserted in
+// on_tool_call and removed in on_tool_result. If the agent terminates between
+// the two hooks (e.g. leak detection), orphaned entries stay in the map.
+// Bounded by concurrent tool calls so not a practical leak.
+#[cfg(feature = "metrics")]
+static TOOL_CALL_TIMERS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
 impl<M> PromptHook<M> for SpacebotHook
 where
     M: CompletionModel,
 {
-    async fn on_completion_call(
-        &self,
-        _prompt: &Message,
-        _history: &[Message],
-    ) -> HookAction {
+    async fn on_completion_call(&self, _prompt: &Message, _history: &[Message]) -> HookAction {
         // Log the completion call but don't block it
         tracing::debug!(
             process_id = %self.process_id,
@@ -156,6 +162,11 @@ where
             "tool call started"
         );
 
+        #[cfg(feature = "metrics")]
+        if let Ok(mut timers) = TOOL_CALL_TIMERS.lock() {
+            timers.insert(_internal_call_id.to_string(), std::time::Instant::now());
+        }
+
         ToolCallHookAction::Continue
     }
 
@@ -178,12 +189,16 @@ where
                 leak_prefix = %&leak[..leak.len().min(8)],
                 "secret leak detected in tool output, terminating agent"
             );
-            return HookAction::Terminate { reason: "Tool output contained a secret. Agent terminated to prevent exfiltration.".into() };
+            return HookAction::Terminate {
+                reason: "Tool output contained a secret. Agent terminated to prevent exfiltration."
+                    .into(),
+            };
         }
 
         // Cap the result stored in the broadcast event to avoid blowing up
         // event subscribers with multi-MB tool results.
-        let capped_result = crate::tools::truncate_output(result, crate::tools::MAX_TOOL_OUTPUT_BYTES);
+        let capped_result =
+            crate::tools::truncate_output(result, crate::tools::MAX_TOOL_OUTPUT_BYTES);
         let event = ProcessEvent::ToolCompleted {
             agent_id: self.agent_id.clone(),
             process_id: self.process_id.clone(),
@@ -199,6 +214,24 @@ where
             result_bytes = result.len(),
             "tool call completed"
         );
+
+        #[cfg(feature = "metrics")]
+        {
+            let metrics = crate::telemetry::Metrics::global();
+            metrics
+                .tool_calls_total
+                .with_label_values(&[&*self.agent_id, tool_name])
+                .inc();
+            if let Some(start) = TOOL_CALL_TIMERS
+                .lock()
+                .ok()
+                .and_then(|mut timers| timers.remove(_internal_call_id))
+            {
+                metrics
+                    .tool_call_duration_seconds
+                    .observe(start.elapsed().as_secs_f64());
+            }
+        }
 
         HookAction::Continue
     }

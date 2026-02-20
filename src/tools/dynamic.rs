@@ -9,7 +9,7 @@
 //! - `tool_search` — discovers available tools by name/description
 //! - `tool_execute` — runs a discovered tool with JSON args
 
-use crate::tools::{truncate_output, MAX_TOOL_OUTPUT_BYTES};
+use crate::tools::{MAX_TOOL_OUTPUT_BYTES, truncate_output};
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use schemars::JsonSchema;
@@ -229,7 +229,10 @@ impl Tool for ToolSearchTool {
 
         tracing::debug!(query = %args.query, results = total, "tool search completed");
 
-        Ok(ToolSearchOutput { tools: results, total })
+        Ok(ToolSearchOutput {
+            tools: results,
+            total,
+        })
     }
 }
 
@@ -321,8 +324,8 @@ impl Tool for ToolExecuteTool {
             .ok_or_else(|| ToolExecuteError::NotFound(args.name.clone()))?;
 
         // Find the runner script
-        let (runner, script_path) = find_runner(&tool_dir)
-            .ok_or_else(|| ToolExecuteError::NoRunner(args.name.clone()))?;
+        let (runner, script_path) =
+            find_runner(&tool_dir).ok_or_else(|| ToolExecuteError::NoRunner(args.name.clone()))?;
 
         // Build the command
         let mut cmd = match runner {
@@ -351,7 +354,8 @@ impl Tool for ToolExecuteTool {
         );
 
         // Spawn the process
-        let mut child = cmd.spawn()
+        let mut child = cmd
+            .spawn()
             .map_err(|e| ToolExecuteError::ExecFailed(format!("failed to spawn: {e}")))?;
 
         // Write args to stdin

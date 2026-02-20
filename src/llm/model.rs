@@ -1,16 +1,15 @@
 //! SpacebotModel: Custom CompletionModel implementation that routes through LlmManager.
 
+use crate::config::{ApiType, ProviderConfig};
 use crate::llm::manager::LlmManager;
 use crate::llm::routing::{
-    self, RoutingConfig, MAX_FALLBACK_ATTEMPTS, MAX_RETRIES_PER_MODEL, RETRY_BASE_DELAY_MS,
+    self, MAX_FALLBACK_ATTEMPTS, MAX_RETRIES_PER_MODEL, RETRY_BASE_DELAY_MS, RoutingConfig,
 };
 
-use rig::completion::{
-    self, CompletionError, CompletionModel, CompletionRequest, GetTokenUsage,
-};
+use rig::completion::{self, CompletionError, CompletionModel, CompletionRequest, GetTokenUsage};
 use rig::message::{
     AssistantContent, DocumentSourceKind, Image, Message, MimeType, Text, ToolCall, ToolFunction,
-    ToolResult, UserContent,
+    UserContent,
 };
 use rig::one_or_many::OneOrMany;
 use rig::streaming::StreamingCompletionResponse;
@@ -50,9 +49,15 @@ pub struct SpacebotModel {
 }
 
 impl SpacebotModel {
-    pub fn provider(&self) -> &str { &self.provider }
-    pub fn model_name(&self) -> &str { &self.model_name }
-    pub fn full_model_name(&self) -> &str { &self.full_model_name }
+    pub fn provider(&self) -> &str {
+        &self.provider
+    }
+    pub fn model_name(&self) -> &str {
+        &self.model_name
+    }
+    pub fn full_model_name(&self) -> &str {
+        &self.full_model_name
+    }
 
     /// Attach routing config for fallback behavior.
     pub fn with_routing(mut self, routing: RoutingConfig) -> Self {
@@ -65,21 +70,41 @@ impl SpacebotModel {
         &self,
         request: CompletionRequest,
     ) -> Result<completion::CompletionResponse<RawResponse>, CompletionError> {
-        match self.provider.as_str() {
-            "anthropic" => self.call_anthropic(request).await,
-            "openai" => self.call_openai(request).await,
-            "openrouter" => self.call_openrouter(request).await,
-            "zhipu" => self.call_zhipu(request).await,
-            "groq" => self.call_groq(request).await,
-            "together" => self.call_together(request).await,
-            "fireworks" => self.call_fireworks(request).await,
-            "deepseek" => self.call_deepseek(request).await,
-            "xai" => self.call_xai(request).await,
-            "mistral" => self.call_mistral(request).await,
-            "opencode-zen" => self.call_opencode_zen(request).await,
-            other => Err(CompletionError::ProviderError(format!(
-                "unknown provider: {other}"
-            ))),
+        let provider_id = self
+            .full_model_name
+            .split_once('/')
+            .map(|(provider, _)| provider)
+            .unwrap_or("anthropic");
+
+        let provider_config = self
+            .llm_manager
+            .get_provider(provider_id)
+            .map_err(|e| CompletionError::ProviderError(e.to_string()))?;
+
+        if provider_id == "zai-coding-plan" || provider_id == "zhipu" {
+            let display_name = if provider_id == "zhipu" {
+                "Z.AI (GLM)"
+            } else {
+                "Z.AI Coding Plan"
+            };
+            let endpoint = format!(
+                "{}/chat/completions",
+                provider_config.base_url.trim_end_matches('/')
+            );
+            return self
+                .call_openai_compatible_with_optional_auth(
+                    request,
+                    display_name,
+                    &endpoint,
+                    Some(provider_config.api_key.clone()),
+                )
+                .await;
+        }
+
+        match provider_config.api_type {
+            ApiType::Anthropic => self.call_anthropic(request, &provider_config).await,
+            ApiType::OpenAiCompletions => self.call_openai(request, &provider_config).await,
+            ApiType::OpenAiResponses => self.call_openai_responses(request, &provider_config).await,
         }
     }
 
@@ -93,10 +118,7 @@ impl SpacebotModel {
         &self,
         model_name: &str,
         request: &CompletionRequest,
-    ) -> Result<
-        completion::CompletionResponse<RawResponse>,
-        (CompletionError, bool),
-    > {
+    ) -> Result<completion::CompletionResponse<RawResponse>, (CompletionError, bool)> {
         let model = if model_name == self.full_model_name {
             self.clone()
         } else {
@@ -179,85 +201,119 @@ impl CompletionModel for SpacebotModel {
         &self,
         request: CompletionRequest,
     ) -> Result<completion::CompletionResponse<RawResponse>, CompletionError> {
-        let Some(routing) = &self.routing else {
-            // No routing config — just call the model directly, no fallback/retry
-            return self.attempt_completion(request).await;
-        };
+        #[cfg(feature = "metrics")]
+        let start = std::time::Instant::now();
 
-        let cooldown = routing.rate_limit_cooldown_secs;
-        let fallbacks = routing.get_fallbacks(&self.full_model_name);
-        let mut last_error: Option<CompletionError> = None;
+        let result = async move {
+            let Some(routing) = &self.routing else {
+                // No routing config — just call the model directly, no fallback/retry
+                return self.attempt_completion(request).await;
+            };
 
-        // Try the primary model (with retries) unless it's in rate-limit cooldown
-        // and we have fallbacks to try instead.
-        let primary_rate_limited = self
-            .llm_manager
-            .is_rate_limited(&self.full_model_name, cooldown)
-            .await;
+            let cooldown = routing.rate_limit_cooldown_secs;
+            let fallbacks = routing.get_fallbacks(&self.full_model_name);
+            let mut last_error: Option<CompletionError> = None;
 
-        let skip_primary = primary_rate_limited && !fallbacks.is_empty();
+            // Try the primary model (with retries) unless it's in rate-limit cooldown
+            // and we have fallbacks to try instead.
+            let primary_rate_limited = self
+                .llm_manager
+                .is_rate_limited(&self.full_model_name, cooldown)
+                .await;
 
-        if skip_primary {
-            tracing::debug!(
-                model = %self.full_model_name,
-                "primary model in rate-limit cooldown, skipping to fallbacks"
-            );
-        } else {
-            match self.attempt_with_retries(&self.full_model_name, &request).await {
-                Ok(response) => return Ok(response),
-                Err((error, was_rate_limit)) => {
-                    if was_rate_limit {
-                        self.llm_manager.record_rate_limit(&self.full_model_name).await;
-                    }
-                    if fallbacks.is_empty() {
-                        // No fallbacks — this is the final error
-                        return Err(error);
-                    }
-                    tracing::warn!(
-                        model = %self.full_model_name,
-                        "primary model exhausted retries, trying fallbacks"
-                    );
-                    last_error = Some(error);
-                }
-            }
-        }
+            let skip_primary = primary_rate_limited && !fallbacks.is_empty();
 
-        // Try fallback chain, each with their own retry loop
-        for (index, fallback_name) in fallbacks.iter().take(MAX_FALLBACK_ATTEMPTS).enumerate() {
-            if self.llm_manager.is_rate_limited(fallback_name, cooldown).await {
+            if skip_primary {
                 tracing::debug!(
-                    fallback = %fallback_name,
-                    "fallback model in cooldown, skipping"
+                    model = %self.full_model_name,
+                    "primary model in rate-limit cooldown, skipping to fallbacks"
                 );
-                continue;
+            } else {
+                match self
+                    .attempt_with_retries(&self.full_model_name, &request)
+                    .await
+                {
+                    Ok(response) => return Ok(response),
+                    Err((error, was_rate_limit)) => {
+                        if was_rate_limit {
+                            self.llm_manager
+                                .record_rate_limit(&self.full_model_name)
+                                .await;
+                        }
+                        if fallbacks.is_empty() {
+                            // No fallbacks — this is the final error
+                            return Err(error);
+                        }
+                        tracing::warn!(
+                            model = %self.full_model_name,
+                            "primary model exhausted retries, trying fallbacks"
+                        );
+                        last_error = Some(error);
+                    }
+                }
             }
 
-            match self.attempt_with_retries(fallback_name, &request).await {
-                Ok(response) => {
-                    tracing::info!(
-                        original = %self.full_model_name,
+            // Try fallback chain, each with their own retry loop
+            for (index, fallback_name) in fallbacks.iter().take(MAX_FALLBACK_ATTEMPTS).enumerate() {
+                if self
+                    .llm_manager
+                    .is_rate_limited(fallback_name, cooldown)
+                    .await
+                {
+                    tracing::debug!(
                         fallback = %fallback_name,
-                        attempt = index + 1,
-                        "fallback model succeeded"
+                        "fallback model in cooldown, skipping"
                     );
-                    return Ok(response);
+                    continue;
                 }
-                Err((error, was_rate_limit)) => {
-                    if was_rate_limit {
-                        self.llm_manager.record_rate_limit(fallback_name).await;
+
+                match self.attempt_with_retries(fallback_name, &request).await {
+                    Ok(response) => {
+                        tracing::info!(
+                            original = %self.full_model_name,
+                            fallback = %fallback_name,
+                            attempt = index + 1,
+                            "fallback model succeeded"
+                        );
+                        return Ok(response);
                     }
-                    tracing::warn!(
-                        fallback = %fallback_name,
-                        "fallback model exhausted retries, continuing chain"
-                    );
-                    last_error = Some(error);
+                    Err((error, was_rate_limit)) => {
+                        if was_rate_limit {
+                            self.llm_manager.record_rate_limit(fallback_name).await;
+                        }
+                        tracing::warn!(
+                            fallback = %fallback_name,
+                            "fallback model exhausted retries, continuing chain"
+                        );
+                        last_error = Some(error);
+                    }
                 }
             }
+
+            Err(last_error.unwrap_or_else(|| {
+                CompletionError::ProviderError("all models in fallback chain failed".into())
+            }))
+        }
+        .await;
+
+        #[cfg(feature = "metrics")]
+        {
+            let elapsed = start.elapsed().as_secs_f64();
+            let metrics = crate::telemetry::Metrics::global();
+            // TODO: agent_id and tier are "unknown" because SpacebotModel doesn't
+            // carry process context. Thread agent_id/ProcessType through to get
+            // per-agent, per-tier breakdowns.
+            metrics
+                .llm_requests_total
+                .with_label_values(&["unknown", &self.full_model_name, "unknown"])
+                .inc();
+            metrics
+                .llm_request_duration_seconds
+                .with_label_values(&["unknown", &self.full_model_name, "unknown"])
+                .observe(elapsed);
         }
 
-        Err(last_error.unwrap_or_else(|| {
-            CompletionError::ProviderError("all models in fallback chain failed".into())
-        }))
+        result
     }
 
     async fn stream(
@@ -274,11 +330,11 @@ impl SpacebotModel {
     async fn call_anthropic(
         &self,
         request: CompletionRequest,
+        provider_config: &ProviderConfig,
     ) -> Result<completion::CompletionResponse<RawResponse>, CompletionError> {
-        let api_key = self
-            .llm_manager
-            .get_api_key("anthropic")
-            .map_err(|e| CompletionError::ProviderError(e.to_string()))?;
+        let base_url = provider_config.base_url.trim_end_matches('/');
+        let messages_url = format!("{base_url}/v1/messages");
+        let api_key = provider_config.api_key.as_str();
 
         let messages = convert_messages_to_anthropic(&request.chat_history);
 
@@ -315,7 +371,7 @@ impl SpacebotModel {
         let mut req = self
             .llm_manager
             .http_client()
-            .post("https://api.anthropic.com/v1/messages")
+            .post(&messages_url)
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json");
 
@@ -324,7 +380,7 @@ impl SpacebotModel {
                 .header("authorization", format!("Bearer {api_key}"))
                 .header("anthropic-beta", "oauth-2025-04-20");
         } else {
-            req = req.header("x-api-key", &api_key);
+            req = req.header("x-api-key", api_key);
         }
 
         let response = req
@@ -334,15 +390,17 @@ impl SpacebotModel {
             .map_err(|e| CompletionError::ProviderError(e.to_string()))?;
 
         let status = response.status();
-        let response_text = response
-            .text()
-            .await
-            .map_err(|e| CompletionError::ProviderError(format!("failed to read response body: {e}")))?;
+        let response_text = response.text().await.map_err(|e| {
+            CompletionError::ProviderError(format!("failed to read response body: {e}"))
+        })?;
 
-        let response_body: serde_json::Value = serde_json::from_str(&response_text)
-            .map_err(|e| CompletionError::ProviderError(format!(
-                "Anthropic response ({status}) is not valid JSON: {e}\nBody: {}", truncate_body(&response_text)
-            )))?;
+        let response_body: serde_json::Value =
+            serde_json::from_str(&response_text).map_err(|e| {
+                CompletionError::ProviderError(format!(
+                    "Anthropic response ({status}) is not valid JSON: {e}\nBody: {}",
+                    truncate_body(&response_text)
+                ))
+            })?;
 
         if !status.is_success() {
             let message = response_body["error"]["message"]
@@ -359,11 +417,9 @@ impl SpacebotModel {
     async fn call_openai(
         &self,
         request: CompletionRequest,
+        provider_config: &ProviderConfig,
     ) -> Result<completion::CompletionResponse<RawResponse>, CompletionError> {
-        let api_key = self
-            .llm_manager
-            .get_api_key("openai")
-            .map_err(|e| CompletionError::ProviderError(e.to_string()))?;
+        let api_key = provider_config.api_key.as_str();
 
         let mut messages = Vec::new();
 
@@ -407,27 +463,42 @@ impl SpacebotModel {
             body["tools"] = serde_json::json!(tools);
         }
 
-        let response = self
+        let chat_completions_url = format!(
+            "{}/v1/chat/completions",
+            provider_config.base_url.trim_end_matches('/')
+        );
+
+        let mut request_builder = self
             .llm_manager
             .http_client()
-            .post("https://api.openai.com/v1/chat/completions")
+            .post(&chat_completions_url)
             .header("authorization", format!("Bearer {api_key}"))
-            .header("content-type", "application/json")
+            .header("content-type", "application/json");
+
+        // Kimi endpoints require a specific user-agent header.
+        if chat_completions_url.contains("kimi.com") || chat_completions_url.contains("moonshot.ai")
+        {
+            request_builder = request_builder.header("user-agent", "KimiCLI/1.3");
+        }
+
+        let response = request_builder
             .json(&body)
             .send()
             .await
             .map_err(|e| CompletionError::ProviderError(e.to_string()))?;
 
         let status = response.status();
-        let response_text = response
-            .text()
-            .await
-            .map_err(|e| CompletionError::ProviderError(format!("failed to read response body: {e}")))?;
+        let response_text = response.text().await.map_err(|e| {
+            CompletionError::ProviderError(format!("failed to read response body: {e}"))
+        })?;
 
-        let response_body: serde_json::Value = serde_json::from_str(&response_text)
-            .map_err(|e| CompletionError::ProviderError(format!(
-                "OpenAI response ({status}) is not valid JSON: {e}\nBody: {}", truncate_body(&response_text)
-            )))?;
+        let response_body: serde_json::Value =
+            serde_json::from_str(&response_text).map_err(|e| {
+                CompletionError::ProviderError(format!(
+                    "OpenAI response ({status}) is not valid JSON: {e}\nBody: {}",
+                    truncate_body(&response_text)
+                ))
+            })?;
 
         if !status.is_success() {
             let message = response_body["error"]["message"]
@@ -441,35 +512,28 @@ impl SpacebotModel {
         parse_openai_response(response_body, "OpenAI")
     }
 
-    async fn call_openrouter(
+    async fn call_openai_responses(
         &self,
         request: CompletionRequest,
+        provider_config: &ProviderConfig,
     ) -> Result<completion::CompletionResponse<RawResponse>, CompletionError> {
-        let api_key = self
-            .llm_manager
-            .get_api_key("openrouter")
-            .map_err(|e| CompletionError::ProviderError(e.to_string()))?;
+        let base_url = provider_config.base_url.trim_end_matches('/');
+        let responses_url = format!("{base_url}/v1/responses");
+        let api_key = provider_config.api_key.as_str();
 
-        // OpenRouter uses the OpenAI chat completions format.
-        // model_name is the full OpenRouter model ID (e.g. "anthropic/claude-sonnet-4-20250514").
-        let mut messages = Vec::new();
-
-        if let Some(preamble) = &request.preamble {
-            messages.push(serde_json::json!({
-                "role": "system",
-                "content": preamble,
-            }));
-        }
-
-        messages.extend(convert_messages_to_openai(&request.chat_history));
+        let input = convert_messages_to_openai_responses(&request.chat_history);
 
         let mut body = serde_json::json!({
             "model": self.model_name,
-            "messages": messages,
+            "input": input,
         });
 
+        if let Some(preamble) = &request.preamble {
+            body["instructions"] = serde_json::json!(preamble);
+        }
+
         if let Some(max_tokens) = request.max_tokens {
-            body["max_tokens"] = serde_json::json!(max_tokens);
+            body["max_output_tokens"] = serde_json::json!(max_tokens);
         }
 
         if let Some(temperature) = request.temperature {
@@ -480,14 +544,12 @@ impl SpacebotModel {
             let tools: Vec<serde_json::Value> = request
                 .tools
                 .iter()
-                .map(|t| {
+                .map(|tool_definition| {
                     serde_json::json!({
                         "type": "function",
-                        "function": {
-                            "name": t.name,
-                            "description": t.description,
-                            "parameters": t.parameters,
-                        }
+                        "name": tool_definition.name,
+                        "description": tool_definition.description,
+                        "parameters": tool_definition.parameters,
                     })
                 })
                 .collect();
@@ -497,7 +559,7 @@ impl SpacebotModel {
         let response = self
             .llm_manager
             .http_client()
-            .post("https://openrouter.ai/api/v1/chat/completions")
+            .post(&responses_url)
             .header("authorization", format!("Bearer {api_key}"))
             .header("content-type", "application/json")
             .json(&body)
@@ -506,112 +568,28 @@ impl SpacebotModel {
             .map_err(|e| CompletionError::ProviderError(e.to_string()))?;
 
         let status = response.status();
-        let response_text = response
-            .text()
-            .await
-            .map_err(|e| CompletionError::ProviderError(format!("failed to read response body: {e}")))?;
+        let response_text = response.text().await.map_err(|e| {
+            CompletionError::ProviderError(format!("failed to read response body: {e}"))
+        })?;
 
-        let response_body: serde_json::Value = serde_json::from_str(&response_text)
-            .map_err(|e| CompletionError::ProviderError(format!(
-                "OpenRouter response ({status}) is not valid JSON: {e}\nBody: {}", truncate_body(&response_text)
-            )))?;
-
-        if !status.is_success() {
-            let message = response_body["error"]["message"]
-                .as_str()
-                .unwrap_or("unknown error");
-            return Err(CompletionError::ProviderError(format!(
-                "OpenRouter API error ({status}): {message}"
-            )));
-        }
-
-        // OpenRouter returns OpenAI-format responses
-        parse_openai_response(response_body, "OpenRouter")
-    }
-
-    async fn call_zhipu(
-        &self,
-        request: CompletionRequest,
-    ) -> Result<completion::CompletionResponse<RawResponse>, CompletionError> {
-        let api_key = self
-            .llm_manager
-            .get_api_key("zhipu")
-            .map_err(|e| CompletionError::ProviderError(e.to_string()))?;
-
-        let mut messages = Vec::new();
-
-        if let Some(preamble) = &request.preamble {
-            messages.push(serde_json::json!({
-                "role": "system",
-                "content": preamble,
-            }));
-        }
-
-        messages.extend(convert_messages_to_openai(&request.chat_history));
-
-        let mut body = serde_json::json!({
-            "model": self.model_name,
-            "messages": messages,
-        });
-
-        if let Some(max_tokens) = request.max_tokens {
-            body["max_tokens"] = serde_json::json!(max_tokens);
-        }
-
-        if let Some(temperature) = request.temperature {
-            body["temperature"] = serde_json::json!(temperature);
-        }
-
-        if !request.tools.is_empty() {
-            let tools: Vec<serde_json::Value> = request
-                .tools
-                .iter()
-                .map(|t| {
-                    serde_json::json!({
-                        "type": "function",
-                        "function": {
-                            "name": t.name,
-                            "description": t.description,
-                            "parameters": t.parameters,
-                        }
-                    })
-                })
-                .collect();
-            body["tools"] = serde_json::json!(tools);
-        }
-
-        let response = self
-            .llm_manager
-            .http_client()
-            .post("https://api.z.ai/api/paas/v4/chat/completions")
-            .header("authorization", format!("Bearer {api_key}"))
-            .header("content-type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| CompletionError::ProviderError(e.to_string()))?;
-
-        let status = response.status();
-        let response_text = response
-            .text()
-            .await
-            .map_err(|e| CompletionError::ProviderError(format!("failed to read response body: {e}")))?;
-
-        let response_body: serde_json::Value = serde_json::from_str(&response_text)
-            .map_err(|e| CompletionError::ProviderError(format!(
-                "Z.ai response ({status}) is not valid JSON: {e}\nBody: {}", truncate_body(&response_text)
-            )))?;
+        let response_body: serde_json::Value =
+            serde_json::from_str(&response_text).map_err(|e| {
+                CompletionError::ProviderError(format!(
+                    "OpenAI Responses API response ({status}) is not valid JSON: {e}\nBody: {}",
+                    truncate_body(&response_text)
+                ))
+            })?;
 
         if !status.is_success() {
             let message = response_body["error"]["message"]
                 .as_str()
                 .unwrap_or("unknown error");
             return Err(CompletionError::ProviderError(format!(
-                "Z.ai API error ({status}): {message}"
+                "OpenAI Responses API error ({status}): {message}"
             )));
         }
 
-        parse_openai_response(response_body, "Z.ai")
+        parse_openai_responses_response(response_body)
     }
 
     /// Generic OpenAI-compatible API call.
@@ -619,14 +597,20 @@ impl SpacebotModel {
     async fn call_openai_compatible(
         &self,
         request: CompletionRequest,
-        provider_id: &str,
         provider_display_name: &str,
-        endpoint: &str,
+        provider_config: &ProviderConfig,
     ) -> Result<completion::CompletionResponse<RawResponse>, CompletionError> {
-        let api_key = self
-            .llm_manager
-            .get_api_key(provider_id)
-            .map_err(|e| CompletionError::ProviderError(e.to_string()))?;
+        let base_url = provider_config.base_url.trim_end_matches('/');
+        let endpoint_path = match provider_config.api_type {
+            ApiType::OpenAiCompletions | ApiType::OpenAiResponses => "/v1/chat/completions",
+            ApiType::Anthropic => {
+                return Err(CompletionError::ProviderError(format!(
+                    "{provider_display_name} is configured with anthropic API type, but this call expects an OpenAI-compatible API"
+                )));
+            }
+        };
+        let endpoint = format!("{base_url}{endpoint_path}");
+        let api_key = provider_config.api_key.as_str();
 
         let mut messages = Vec::new();
 
@@ -673,7 +657,7 @@ impl SpacebotModel {
         let response = self
             .llm_manager
             .http_client()
-            .post(endpoint)
+            .post(&endpoint)
             .header("authorization", format!("Bearer {api_key}"))
             .header("content-type", "application/json")
             .json(&body)
@@ -682,15 +666,17 @@ impl SpacebotModel {
             .map_err(|e| CompletionError::ProviderError(e.to_string()))?;
 
         let status = response.status();
-        let response_text = response
-            .text()
-            .await
-            .map_err(|e| CompletionError::ProviderError(format!("failed to read response body: {e}")))?;
+        let response_text = response.text().await.map_err(|e| {
+            CompletionError::ProviderError(format!("failed to read response body: {e}"))
+        })?;
 
-        let response_body: serde_json::Value = serde_json::from_str(&response_text)
-            .map_err(|e| CompletionError::ProviderError(format!(
-                "{provider_display_name} response ({status}) is not valid JSON: {e}\nBody: {}", truncate_body(&response_text)
-            )))?;
+        let response_body: serde_json::Value =
+            serde_json::from_str(&response_text).map_err(|e| {
+                CompletionError::ProviderError(format!(
+                    "{provider_display_name} response ({status}) is not valid JSON: {e}\nBody: {}",
+                    truncate_body(&response_text)
+                ))
+            })?;
 
         if !status.is_success() {
             let message = response_body["error"]["message"]
@@ -704,92 +690,113 @@ impl SpacebotModel {
         parse_openai_response(response_body, provider_display_name)
     }
 
-    async fn call_groq(
+    /// Generic OpenAI-compatible API call with optional bearer auth.
+    async fn call_openai_compatible_with_optional_auth(
         &self,
         request: CompletionRequest,
+        provider_display_name: &str,
+        endpoint: &str,
+        api_key: Option<String>,
     ) -> Result<completion::CompletionResponse<RawResponse>, CompletionError> {
-        self.call_openai_compatible(
-            request,
-            "groq",
-            "Groq",
-            "https://api.groq.com/openai/v1/chat/completions",
-        ).await
-    }
+        let mut messages = Vec::new();
 
-    async fn call_together(
-        &self,
-        request: CompletionRequest,
-    ) -> Result<completion::CompletionResponse<RawResponse>, CompletionError> {
-        self.call_openai_compatible(
-            request,
-            "together",
-            "Together AI",
-            "https://api.together.xyz/v1/chat/completions",
-        ).await
-    }
+        if let Some(preamble) = &request.preamble {
+            messages.push(serde_json::json!({
+                "role": "system",
+                "content": preamble,
+            }));
+        }
 
-    async fn call_fireworks(
-        &self,
-        request: CompletionRequest,
-    ) -> Result<completion::CompletionResponse<RawResponse>, CompletionError> {
-        self.call_openai_compatible(
-            request,
-            "fireworks",
-            "Fireworks AI",
-            "https://api.fireworks.ai/inference/v1/chat/completions",
-        ).await
-    }
+        messages.extend(convert_messages_to_openai(&request.chat_history));
 
-    async fn call_deepseek(
-        &self,
-        request: CompletionRequest,
-    ) -> Result<completion::CompletionResponse<RawResponse>, CompletionError> {
-        self.call_openai_compatible(
-            request,
-            "deepseek",
-            "DeepSeek",
-            "https://api.deepseek.com/v1/chat/completions",
-        ).await
-    }
+        let mut body = serde_json::json!({
+            "model": self.model_name,
+            "messages": messages,
+        });
 
-    async fn call_xai(
-        &self,
-        request: CompletionRequest,
-    ) -> Result<completion::CompletionResponse<RawResponse>, CompletionError> {
-        self.call_openai_compatible(
-            request,
-            "xai",
-            "xAI",
-            "https://api.x.ai/v1/chat/completions",
-        ).await
-    }
+        if let Some(max_tokens) = request.max_tokens {
+            body["max_tokens"] = serde_json::json!(max_tokens);
+        }
 
-    async fn call_mistral(
-        &self,
-        request: CompletionRequest,
-    ) -> Result<completion::CompletionResponse<RawResponse>, CompletionError> {
-        self.call_openai_compatible(
-            request,
-            "mistral",
-            "Mistral AI",
-            "https://api.mistral.ai/v1/chat/completions",
-        ).await
-    }
+        if let Some(temperature) = request.temperature {
+            body["temperature"] = serde_json::json!(temperature);
+        }
 
-    async fn call_opencode_zen(
-        &self,
-        request: CompletionRequest,
-    ) -> Result<completion::CompletionResponse<RawResponse>, CompletionError> {
-        self.call_openai_compatible(
-            request,
-            "opencode-zen",
-            "OpenCode Zen",
-            "https://opencode.ai/zen/v1/chat/completions",
-        ).await
+        if !request.tools.is_empty() {
+            let tools: Vec<serde_json::Value> = request
+                .tools
+                .iter()
+                .map(|t| {
+                    serde_json::json!({
+                        "type": "function",
+                        "function": {
+                            "name": t.name,
+                            "description": t.description,
+                            "parameters": t.parameters,
+                        }
+                    })
+                })
+                .collect();
+            body["tools"] = serde_json::json!(tools);
+        }
+
+        let response = self.llm_manager.http_client().post(endpoint);
+
+        let response = if let Some(api_key) = api_key {
+            response.header("authorization", format!("Bearer {api_key}"))
+        } else {
+            response
+        };
+
+        let response = response
+            .header("content-type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| CompletionError::ProviderError(e.to_string()))?;
+
+        let status = response.status();
+        let response_text = response.text().await.map_err(|e| {
+            CompletionError::ProviderError(format!("failed to read response body: {e}"))
+        })?;
+
+        let response_body: serde_json::Value =
+            serde_json::from_str(&response_text).map_err(|e| {
+                CompletionError::ProviderError(format!(
+                    "{provider_display_name} response ({status}) is not valid JSON: {e}\nBody: {}",
+                    truncate_body(&response_text)
+                ))
+            })?;
+
+        if !status.is_success() {
+            let message = response_body["error"]["message"]
+                .as_str()
+                .unwrap_or("unknown error");
+            return Err(CompletionError::ProviderError(format!(
+                "{provider_display_name} API error ({status}): {message}"
+            )));
+        }
+
+        parse_openai_response(response_body, provider_display_name)
     }
 }
-
 // --- Helpers ---
+
+fn normalize_ollama_base_url(configured: Option<String>) -> String {
+    let mut base_url = configured
+        .unwrap_or_else(|| "http://localhost:11434".to_string())
+        .trim()
+        .trim_end_matches('/')
+        .to_string();
+
+    if base_url.ends_with("/api") {
+        base_url.truncate(base_url.len() - "/api".len());
+    } else if base_url.ends_with("/v1") {
+        base_url.truncate(base_url.len() - "/v1".len());
+    }
+
+    base_url
+}
 
 fn tool_result_content_to_string(content: &OneOrMany<rig::message::ToolResultContent>) -> String {
     content
@@ -941,6 +948,83 @@ fn convert_messages_to_openai(messages: &OneOrMany<Message>) -> Vec<serde_json::
     result
 }
 
+fn convert_messages_to_openai_responses(messages: &OneOrMany<Message>) -> Vec<serde_json::Value> {
+    let mut result = Vec::new();
+
+    for message in messages.iter() {
+        match message {
+            Message::User { content } => {
+                let mut content_parts = Vec::new();
+
+                for item in content.iter() {
+                    match item {
+                        UserContent::Text(text) => {
+                            content_parts.push(serde_json::json!({
+                                "type": "input_text",
+                                "text": text.text,
+                            }));
+                        }
+                        UserContent::Image(image) => {
+                            if let Some(part) = convert_image_openai_responses(image) {
+                                content_parts.push(part);
+                            }
+                        }
+                        UserContent::ToolResult(tool_result) => {
+                            result.push(serde_json::json!({
+                                "type": "function_call_output",
+                                "call_id": tool_result.id,
+                                "output": tool_result_content_to_string(&tool_result.content),
+                            }));
+                        }
+                        _ => {}
+                    }
+                }
+
+                if !content_parts.is_empty() {
+                    result.push(serde_json::json!({
+                        "role": "user",
+                        "content": content_parts,
+                    }));
+                }
+            }
+            Message::Assistant { content, .. } => {
+                let mut text_parts = Vec::new();
+
+                for item in content.iter() {
+                    match item {
+                        AssistantContent::Text(text) => {
+                            text_parts.push(serde_json::json!({
+                                "type": "output_text",
+                                "text": text.text,
+                            }));
+                        }
+                        AssistantContent::ToolCall(tool_call) => {
+                            let arguments = serde_json::to_string(&tool_call.function.arguments)
+                                .unwrap_or_else(|_| "{}".to_string());
+                            result.push(serde_json::json!({
+                                "type": "function_call",
+                                "name": tool_call.function.name,
+                                "arguments": arguments,
+                                "call_id": tool_call.id,
+                            }));
+                        }
+                        _ => {}
+                    }
+                }
+
+                if !text_parts.is_empty() {
+                    result.push(serde_json::json!({
+                        "role": "assistant",
+                        "content": text_parts,
+                    }));
+                }
+            }
+        }
+    }
+
+    result
+}
+
 // --- Image conversion helpers ---
 
 /// Convert a rig Image to an Anthropic image content block.
@@ -997,6 +1081,29 @@ fn convert_image_openai(image: &Image) -> Option<serde_json::Value> {
     }
 }
 
+fn convert_image_openai_responses(image: &Image) -> Option<serde_json::Value> {
+    let media_type = image
+        .media_type
+        .as_ref()
+        .map(|mime_type| mime_type.to_mime_type())
+        .unwrap_or("image/jpeg");
+
+    match &image.data {
+        DocumentSourceKind::Base64(data) => {
+            let data_url = format!("data:{media_type};base64,{data}");
+            Some(serde_json::json!({
+                "type": "input_image",
+                "image_url": data_url,
+            }))
+        }
+        DocumentSourceKind::Url(url) => Some(serde_json::json!({
+            "type": "input_image",
+            "image_url": url,
+        })),
+        _ => None,
+    }
+}
+
 /// Truncate a response body for error messages to avoid dumping megabytes of HTML.
 fn truncate_body(body: &str) -> &str {
     let limit = 500;
@@ -1013,7 +1120,10 @@ fn make_tool_call(id: String, name: String, arguments: serde_json::Value) -> Too
     ToolCall {
         id,
         call_id: None,
-        function: ToolFunction { name: name.trim().to_string(), arguments },
+        function: ToolFunction {
+            name: name.trim().to_string(),
+            arguments,
+        },
         signature: None,
         additional_params: None,
     }
@@ -1039,8 +1149,9 @@ fn parse_anthropic_response(
                 let id = block["id"].as_str().unwrap_or("").to_string();
                 let name = block["name"].as_str().unwrap_or("").to_string();
                 let arguments = block["input"].clone();
-                assistant_content
-                    .push(AssistantContent::ToolCall(make_tool_call(id, name, arguments)));
+                assistant_content.push(AssistantContent::ToolCall(make_tool_call(
+                    id, name, arguments,
+                )));
             }
             Some("thinking") | Some("redacted_thinking") => {
                 // These are provider-side reasoning blocks. They can appear without a
@@ -1096,22 +1207,47 @@ fn parse_openai_response(
         }
     }
 
+    // Some reasoning models (e.g., NVIDIA kimi-k2.5) return reasoning in a separate field
+    if assistant_content.is_empty() {
+        if let Some(reasoning) = choice["reasoning_content"].as_str() {
+            if !reasoning.is_empty() {
+                tracing::debug!(
+                    provider = %provider_label,
+                    "extracted reasoning_content as main content"
+                );
+                assistant_content.push(AssistantContent::Text(Text {
+                    text: reasoning.to_string(),
+                }));
+            }
+        }
+    }
+
     if let Some(tool_calls) = choice["tool_calls"].as_array() {
         for tc in tool_calls {
             let id = tc["id"].as_str().unwrap_or("").to_string();
             let name = tc["function"]["name"].as_str().unwrap_or("").to_string();
-            // OpenAI returns arguments as a JSON string, parse it back to Value
-            let arguments = tc["function"]["arguments"]
+            // OpenAI-compatible APIs usually return arguments as a JSON string.
+            // Some providers return it as a raw JSON object instead.
+            let arguments_field = &tc["function"]["arguments"];
+            let arguments = arguments_field
                 .as_str()
-                .and_then(|s| serde_json::from_str(s).ok())
+                .and_then(|raw| serde_json::from_str(raw).ok())
+                .or_else(|| arguments_field.as_object().map(|_| arguments_field.clone()))
                 .unwrap_or(serde_json::json!({}));
-            assistant_content
-                .push(AssistantContent::ToolCall(make_tool_call(id, name, arguments)));
+            assistant_content.push(AssistantContent::ToolCall(make_tool_call(
+                id, name, arguments,
+            )));
         }
     }
 
-    let result_choice = OneOrMany::many(assistant_content)
-        .map_err(|_| CompletionError::ResponseError(format!("empty response from {provider_label}")))?;
+    let result_choice = OneOrMany::many(assistant_content.clone()).map_err(|_| {
+        tracing::warn!(
+            provider = %provider_label,
+            choice = ?choice,
+            "empty response from provider"
+        );
+        CompletionError::ResponseError(format!("empty response from {provider_label}"))
+    })?;
 
     let input_tokens = body["usage"]["prompt_tokens"].as_u64().unwrap_or(0);
     let output_tokens = body["usage"]["completion_tokens"].as_u64().unwrap_or(0);
@@ -1121,6 +1257,74 @@ fn parse_openai_response(
 
     Ok(completion::CompletionResponse {
         choice: result_choice,
+        usage: completion::Usage {
+            input_tokens,
+            output_tokens,
+            total_tokens: input_tokens + output_tokens,
+            cached_input_tokens: cached,
+        },
+        raw_response: RawResponse { body },
+    })
+}
+
+fn parse_openai_responses_response(
+    body: serde_json::Value,
+) -> Result<completion::CompletionResponse<RawResponse>, CompletionError> {
+    let output_items = body["output"]
+        .as_array()
+        .ok_or_else(|| CompletionError::ResponseError("missing output array".into()))?;
+
+    let mut assistant_content = Vec::new();
+
+    for output_item in output_items {
+        match output_item["type"].as_str() {
+            Some("message") => {
+                if let Some(content_items) = output_item["content"].as_array() {
+                    for content_item in content_items {
+                        if content_item["type"].as_str() == Some("output_text") {
+                            if let Some(text) = content_item["text"].as_str() {
+                                if !text.is_empty() {
+                                    assistant_content.push(AssistantContent::Text(Text {
+                                        text: text.to_string(),
+                                    }));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Some("function_call") => {
+                let call_id = output_item["call_id"]
+                    .as_str()
+                    .or_else(|| output_item["id"].as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let name = output_item["name"].as_str().unwrap_or("").to_string();
+                let arguments = output_item["arguments"]
+                    .as_str()
+                    .and_then(|arguments| serde_json::from_str(arguments).ok())
+                    .unwrap_or(serde_json::json!({}));
+
+                assistant_content.push(AssistantContent::ToolCall(make_tool_call(
+                    call_id, name, arguments,
+                )));
+            }
+            _ => {}
+        }
+    }
+
+    let choice = OneOrMany::many(assistant_content).map_err(|_| {
+        CompletionError::ResponseError("empty response from OpenAI Responses API".into())
+    })?;
+
+    let input_tokens = body["usage"]["input_tokens"].as_u64().unwrap_or(0);
+    let output_tokens = body["usage"]["output_tokens"].as_u64().unwrap_or(0);
+    let cached = body["usage"]["input_tokens_details"]["cached_tokens"]
+        .as_u64()
+        .unwrap_or(0);
+
+    Ok(completion::CompletionResponse {
+        choice,
         usage: completion::Usage {
             input_tokens,
             output_tokens,

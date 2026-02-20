@@ -1,6 +1,6 @@
 //! Cron job management tool for creating, listing, and deleting scheduled tasks.
 
-use crate::cron::scheduler::{CronConfig, Scheduler};
+use crate::cron::scheduler::{CronConfig, Scheduler, is_one_shot_schedule, validate_schedule};
 use crate::cron::store::CronStore;
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
@@ -93,7 +93,7 @@ impl Tool for CronTool {
                     },
                     "schedule": {
                         "type": "string",
-                        "description": "For 'create': a cron expression (e.g. '0 9 * * *' for daily at 9am, '*/5 * * * *' for every 5 minutes). Format: minute hour day-of-month month day-of-week."
+                        "description": "For 'create': either a cron expression (e.g. '0 9 * * *' for daily at 9am, '*/5 * * * *' for every 5 minutes) or a one-shot timestamp ('@once:2026-02-20T14:30:00Z')."
                     },
                     "delivery_target": {
                         "type": "string",
@@ -125,7 +125,9 @@ impl Tool for CronTool {
 
 impl CronTool {
     async fn create(&self, args: CronArgs) -> Result<CronOutput, CronError> {
-        let id = args.id.ok_or_else(|| CronError("'id' is required for create".into()))?;
+        let id = args
+            .id
+            .ok_or_else(|| CronError("'id' is required for create".into()))?;
         let prompt = args
             .prompt
             .ok_or_else(|| CronError("'prompt' is required for create".into()))?;
@@ -136,9 +138,8 @@ impl CronTool {
             .delivery_target
             .ok_or_else(|| CronError("'delivery_target' is required for create".into()))?;
 
-        // Validate the cron expression
-        let cron = croner::Cron::from_str(&schedule)
-            .map_err(|e| CronError(format!("invalid cron expression '{schedule}': {e}")))?;
+        validate_schedule(&schedule)
+            .map_err(|error| CronError(format!("invalid schedule '{schedule}': {error}")))?;
 
         let config = CronConfig {
             id: id.clone(),
@@ -160,9 +161,16 @@ impl CronTool {
             .await
             .map_err(|error| CronError(format!("failed to register: {error}")))?;
 
-        // Generate a human-readable description of the schedule
-        let description = cron.describe();
-        let message = format!("Cron job '{id}' created. Schedule: {schedule} ({description}).");
+        // Generate a human-readable description of the schedule.
+        let message = if is_one_shot_schedule(&schedule) {
+            format!("Cron job '{id}' created. It will run once at {schedule}.")
+        } else {
+            let cron = croner::Cron::from_str(&schedule).map_err(|error| {
+                CronError(format!("invalid cron expression '{schedule}': {error}"))
+            })?;
+            let description = cron.describe();
+            format!("Cron job '{id}' created. Schedule: {schedule} ({description}).")
+        };
 
         tracing::info!(cron_id = %id, %schedule, %delivery_target, "cron job created via tool");
 

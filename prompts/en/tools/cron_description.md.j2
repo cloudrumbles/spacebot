@@ -1,6 +1,8 @@
 Manage scheduled tasks (cron jobs). Use this to create, list, or delete cron jobs. A cron job runs a prompt on a schedule and delivers the result to a messaging channel.
 
-Schedule uses standard cron expression syntax (5 fields): minute hour day-of-month month day-of-week.
+Schedule supports either:
+- standard cron expression syntax (5 fields): minute hour day-of-month month day-of-week
+- one-shot absolute timestamp: `@once:<RFC3339>` (for example `@once:2026-02-20T14:30:00Z`)
 
 Examples:
 - "0 9 * * *" = every day at 9:00 AM
@@ -8,3 +10,4 @@ Examples:
 - "0 9 * * 1-5" = weekdays at 9:00 AM
 - "30 14 1 * *" = 1st of every month at 2:30 PM
 - "0 0 * * 0" = every Sunday at midnight
+- "@once:2026-02-20T14:30:00Z" = run once at that exact timestamp

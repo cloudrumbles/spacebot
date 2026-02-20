@@ -33,7 +33,7 @@ pub struct RoutingConfig {
 
 impl Default for RoutingConfig {
     fn default() -> Self {
-        Self::for_model("anthropic/claude-sonnet-4-20250514".into())
+        Self::for_model("anthropic/claude-sonnet-4".into())
     }
 }
 
@@ -132,10 +132,8 @@ pub fn is_context_overflow_error(error_message: &str) -> bool {
 /// each provider sane defaults so things work out of the box.
 pub fn defaults_for_provider(provider: &str) -> RoutingConfig {
     match provider {
-        "anthropic" => RoutingConfig::for_model("anthropic/claude-sonnet-4-20250514".into()),
-        "openrouter" => {
-            RoutingConfig::for_model("openrouter/anthropic/claude-sonnet-4-20250514".into())
-        }
+        "anthropic" => RoutingConfig::for_model("anthropic/claude-sonnet-4".into()),
+        "openrouter" => RoutingConfig::for_model("openrouter/anthropic/claude-sonnet-4".into()),
         "openai" => RoutingConfig::for_model("openai/gpt-4.1".into()),
         "zhipu" => RoutingConfig::for_model("zhipu/glm-4-plus".into()),
         "groq" => RoutingConfig::for_model("groq/llama-3.3-70b-versatile".into()),
@@ -148,7 +146,11 @@ pub fn defaults_for_provider(provider: &str) -> RoutingConfig {
         "deepseek" => RoutingConfig::for_model("deepseek/deepseek-chat".into()),
         "xai" => RoutingConfig::for_model("xai/grok-2-latest".into()),
         "mistral" => RoutingConfig::for_model("mistral/mistral-large-latest".into()),
+        "nvidia" => RoutingConfig::for_model("nvidia/meta/llama-3.1-405b-instruct".into()),
         "opencode-zen" => RoutingConfig::for_model("opencode-zen/kimi-k2.5".into()),
+        "minimax" => RoutingConfig::for_model("minimax/MiniMax-M1-80k".into()),
+        "moonshot" => RoutingConfig::for_model("moonshot/kimi-k2.5".into()),
+        "zai-coding-plan" => RoutingConfig::for_model("zai-coding-plan/glm-5".into()),
         _ => RoutingConfig::default(),
     }
 }
@@ -166,7 +168,11 @@ pub fn provider_to_prefix(provider: &str) -> &str {
         "deepseek" => "deepseek/",
         "xai" => "xai/",
         "mistral" => "mistral/",
+        "nvidia" => "nvidia/",
         "opencode-zen" => "opencode-zen/",
+        "minimax" => "minimax/",
+        "moonshot" => "moonshot/",
+        "zai-coding-plan" => "zai-coding-plan/",
         _ => "",
     }
 }

@@ -28,7 +28,7 @@ impl CronStore {
                 schedule = excluded.schedule,
                 delivery_target = excluded.delivery_target,
                 enabled = excluded.enabled
-            "#
+            "#,
         )
         .bind(&config.id)
         .bind(&config.prompt)
@@ -50,7 +50,7 @@ impl CronStore {
             FROM cron_jobs
             WHERE enabled = 1
             ORDER BY created_at ASC
-            "#
+            "#,
         )
         .fetch_all(&self.pool)
         .await
@@ -61,7 +61,9 @@ impl CronStore {
             .map(|row| CronConfig {
                 id: row.try_get("id").unwrap_or_default(),
                 prompt: row.try_get("prompt").unwrap_or_default(),
-                schedule: row.try_get("schedule").unwrap_or_else(|_| default_schedule()),
+                schedule: row
+                    .try_get("schedule")
+                    .unwrap_or_else(|_| default_schedule()),
                 delivery_target: row.try_get("delivery_target").unwrap_or_default(),
                 enabled: row.try_get::<i64, _>("enabled").unwrap_or(1) != 0,
             })
@@ -137,7 +139,9 @@ impl CronStore {
             .map(|row| CronConfig {
                 id: row.try_get("id").unwrap_or_default(),
                 prompt: row.try_get("prompt").unwrap_or_default(),
-                schedule: row.try_get("schedule").unwrap_or_else(|_| default_schedule()),
+                schedule: row
+                    .try_get("schedule")
+                    .unwrap_or_else(|_| default_schedule()),
                 delivery_target: row.try_get("delivery_target").unwrap_or_default(),
                 enabled: row.try_get::<i64, _>("enabled").unwrap_or(1) != 0,
             })
@@ -147,7 +151,11 @@ impl CronStore {
     }
 
     /// Load execution history for a specific cron job.
-    pub async fn load_executions(&self, cron_id: &str, limit: i64) -> Result<Vec<CronExecutionEntry>> {
+    pub async fn load_executions(
+        &self,
+        cron_id: &str,
+        limit: i64,
+    ) -> Result<Vec<CronExecutionEntry>> {
         let rows = sqlx::query(
             r#"
             SELECT id, executed_at, success, result_summary

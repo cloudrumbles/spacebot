@@ -22,7 +22,7 @@ import {TagInput} from "@/components/TagInput";
 import {FontAwesomeIcon} from "@fortawesome/react-fontawesome";
 import {faChevronDown} from "@fortawesome/free-solid-svg-icons";
 
-type Platform = "discord" | "slack" | "telegram" | "webhook";
+type Platform = "discord" | "slack" | "telegram" | "twitch" | "webhook";
 
 interface ChannelSettingCardProps {
 	platform: Platform;
@@ -201,6 +201,12 @@ export function ChannelSettingCard({
 			if (!credentialInputs.telegram_token?.trim()) return;
 			request.platform_credentials = {
 				telegram_token: credentialInputs.telegram_token.trim(),
+			};
+		} else if (platform === "twitch") {
+			if (!credentialInputs.twitch_username?.trim() || !credentialInputs.twitch_oauth_token?.trim()) return;
+			request.platform_credentials = {
+				twitch_username: credentialInputs.twitch_username.trim(),
+				twitch_oauth_token: credentialInputs.twitch_oauth_token.trim(),
 			};
 		}
 		saveCreds.mutate(request);
@@ -484,6 +490,12 @@ function CredentialsSection({
 							if (e.key === "Enter") onSave();
 						}}
 					/>
+					<p className="mt-1.5 text-xs text-ink-faint">
+						Need help?{" "}
+						<a href="https://docs.spacebot.sh/discord-setup" target="_blank" rel="noopener noreferrer" className="text-accent hover:underline">
+							Read the Discord setup docs &rarr;
+						</a>
+					</p>
 				</div>
 			)}
 
@@ -530,6 +542,12 @@ function CredentialsSection({
 							}}
 						/>
 					</div>
+					<p className="text-xs text-ink-faint">
+						Need help?{" "}
+						<a href="https://docs.spacebot.sh/slack-setup" target="_blank" rel="noopener noreferrer" className="text-accent hover:underline">
+							Read the Slack setup docs &rarr;
+						</a>
+					</p>
 				</>
 			)}
 
@@ -557,7 +575,64 @@ function CredentialsSection({
 							if (e.key === "Enter") onSave();
 						}}
 					/>
+					<p className="mt-1.5 text-xs text-ink-faint">
+						Need help?{" "}
+						<a href="https://docs.spacebot.sh/telegram-setup" target="_blank" rel="noopener noreferrer" className="text-accent hover:underline">
+							Read the Telegram setup docs &rarr;
+						</a>
+					</p>
 				</div>
+			)}
+
+			{platform === "twitch" && (
+				<>
+					<div>
+						<label className="mb-1.5 block text-sm font-medium text-ink-dull">
+							Bot Username
+						</label>
+						<Input
+							size="lg"
+							value={credentialInputs.twitch_username ?? ""}
+							onChange={(e) =>
+								setCredentialInputs({
+									...credentialInputs,
+									twitch_username: e.target.value,
+								})
+							}
+							placeholder={
+								configured ? "Enter new username to update" : "my_bot"
+							}
+						/>
+					</div>
+					<div>
+						<label className="mb-1.5 block text-sm font-medium text-ink-dull">
+							OAuth Token
+						</label>
+						<Input
+							type="password"
+							size="lg"
+							value={credentialInputs.twitch_oauth_token ?? ""}
+							onChange={(e) =>
+								setCredentialInputs({
+									...credentialInputs,
+									twitch_oauth_token: e.target.value,
+								})
+							}
+							placeholder={
+								configured ? "Enter new token to update" : "oauth:abc123..."
+							}
+							onKeyDown={(e) => {
+								if (e.key === "Enter") onSave();
+							}}
+						/>
+					</div>
+					<p className="mt-1.5 text-xs text-ink-faint">
+						Need help?{" "}
+						<a href="https://docs.spacebot.sh/twitch-setup" target="_blank" rel="noopener noreferrer" className="text-accent hover:underline">
+							Read the Twitch setup docs &rarr;
+						</a>
+					</p>
+				</>
 			)}
 
 			{platform === "webhook" && (
@@ -824,6 +899,21 @@ function BindingForm({
 							setBindingForm({...bindingForm, channel_ids: ids})
 						}
 						placeholder="Add channel ID..."
+					/>
+				</div>
+			)}
+
+			{platform === "twitch" && (
+				<div>
+					<label className="mb-1 block text-sm font-medium text-ink-dull">
+						Channels
+					</label>
+					<TagInput
+						value={bindingForm.channel_ids}
+						onChange={(ids) =>
+							setBindingForm({...bindingForm, channel_ids: ids})
+						}
+						placeholder="Add channel name..."
 					/>
 				</div>
 			)}

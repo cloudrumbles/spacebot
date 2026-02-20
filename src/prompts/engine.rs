@@ -1,6 +1,6 @@
 use crate::error::Result;
 use anyhow::Context;
-use minijinja::{context, Environment, Value};
+use minijinja::{Environment, Value, context};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -71,6 +71,10 @@ impl PromptEngine {
         env.add_template(
             "fragments/skills_worker",
             crate::prompts::text::get("fragments/skills_worker"),
+        )?;
+        env.add_template(
+            "fragments/available_channels",
+            crate::prompts::text::get("fragments/available_channels"),
         )?;
 
         // System message fragments
@@ -230,6 +234,16 @@ impl PromptEngine {
         )
     }
 
+    /// Render the available channels fragment for cross-channel awareness.
+    pub fn render_available_channels(&self, channels: Vec<ChannelEntry>) -> Result<String> {
+        self.render(
+            "fragments/available_channels",
+            context! {
+                channels => channels,
+            },
+        )
+    }
+
     /// Convenience method for rendering skills worker fragment.
     pub fn render_skills_worker(&self, skill_name: &str, skill_content: &str) -> Result<String> {
         self.render(
@@ -368,6 +382,7 @@ impl PromptEngine {
         conversation_context: Option<String>,
         status_text: Option<String>,
         coalesce_hint: Option<String>,
+        available_channels: Option<String>,
     ) -> Result<String> {
         self.render(
             "channel",
@@ -379,6 +394,7 @@ impl PromptEngine {
                 conversation_context => conversation_context,
                 status_text => status_text,
                 coalesce_hint => coalesce_hint,
+                available_channels => available_channels,
             },
         )
     }
@@ -414,6 +430,14 @@ pub struct SkillInfo {
     pub name: String,
     pub description: String,
     pub location: String,
+}
+
+/// Information about a channel for template rendering.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ChannelEntry {
+    pub name: String,
+    pub platform: String,
+    pub id: String,
 }
 
 // All templates are now loaded from the centralized text registry (src/prompts/text.rs)

@@ -1,7 +1,8 @@
 [package]
 name = "spacebot"
-version = "0.1.8"
+version = "0.1.9"
 edition = "2024"
+default-run = "spacebot"
 
 [dependencies]
 # Core async runtime
@@ -96,6 +97,9 @@ rustls = { version = "0.23", default-features = false, features = ["ring"] }
 # Telegram
 teloxide = { version = "0.17", default-features = false, features = ["rustls"] }
 
+# Twitch
+twitch-irc = { version = "5.0", default-features = false, features = ["transport-tcp-rustls-webpki-roots"] }
+
 # Stream utilities
 tokio-stream = "0.1"
 
@@ -128,6 +132,13 @@ semver = "1"
 zip = "2"
 tempfile = "3"
 
+# Prometheus metrics (optional, behind "metrics" feature)
+prometheus = { version = "0.13", optional = true }
+pdf-extract = "0.10.0"
+
+[features]
+metrics = ["dep:prometheus"]
+
 [lints.clippy]
 dbg_macro = "forbid"
 todo = "forbid"
@@ -135,3 +146,7 @@ unimplemented = "forbid"
 
 [dev-dependencies]
 tokio-test = "0.4"
+
+[profile.release]
+lto = "thin"
+strip = true

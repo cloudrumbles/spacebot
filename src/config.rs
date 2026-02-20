@@ -4,7 +4,7 @@ use crate::error::{ConfigError, Result};
 use crate::llm::routing::RoutingConfig;
 use anyhow::Context as _;
 use arc_swap::ArcSwap;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -45,6 +45,8 @@ pub struct Config {
     pub bindings: Vec<Binding>,
     /// HTTP API server configuration.
     pub api: ApiConfig,
+    /// Prometheus metrics endpoint configuration.
+    pub metrics: MetricsConfig,
     /// OpenTelemetry export configuration.
     pub telemetry: TelemetryConfig,
 }
@@ -70,6 +72,64 @@ impl Default for ApiConfig {
     }
 }
 
+/// Prometheus metrics endpoint configuration.
+#[derive(Debug, Clone)]
+pub struct MetricsConfig {
+    /// Whether the metrics endpoint is enabled.
+    pub enabled: bool,
+    /// Port to bind the metrics HTTP server on.
+    pub port: u16,
+    /// Address to bind the metrics HTTP server on.
+    pub bind: String,
+}
+
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            port: 9090,
+            bind: "0.0.0.0".into(),
+        }
+    }
+}
+
+/// API types supported by LLM providers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApiType {
+    /// OpenAI Completions API (https://api.openai.com/v1/completions)
+    OpenAiCompletions,
+    /// OpenAI Responses API (https://api.openai.com/v1/chat/completions)
+    OpenAiResponses,
+    /// Anthropic Messages API (https://api.anthropic.com/v1/messages)
+    Anthropic,
+}
+
+impl<'de> serde::Deserialize<'de> for ApiType {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        match s.as_str() {
+            "openai_completions" => Ok(Self::OpenAiCompletions),
+            "openai_responses" => Ok(Self::OpenAiResponses),
+            "anthropic" => Ok(Self::Anthropic),
+            other => Err(serde::de::Error::invalid_value(
+                serde::de::Unexpected::Str(other),
+                &"one of \"openai_completions\", \"openai_responses\", or \"anthropic\"",
+            )),
+        }
+    }
+}
+
+/// Configuration for a single LLM provider.
+#[derive(Debug, Clone)]
+pub struct ProviderConfig {
+    pub api_type: ApiType,
+    pub base_url: String,
+    pub api_key: String,
+    pub name: Option<String>,
+}
+
 /// LLM provider credentials (instance-level).
 #[derive(Debug, Clone)]
 pub struct LlmConfig {
@@ -83,11 +143,18 @@ pub struct LlmConfig {
     pub deepseek_key: Option<String>,
     pub xai_key: Option<String>,
     pub mistral_key: Option<String>,
+    pub ollama_key: Option<String>,
+    pub ollama_base_url: Option<String>,
     pub opencode_zen_key: Option<String>,
+    pub nvidia_key: Option<String>,
+    pub minimax_key: Option<String>,
+    pub moonshot_key: Option<String>,
+    pub zai_coding_plan_key: Option<String>,
+    pub providers: HashMap<String, ProviderConfig>,
 }
 
 impl LlmConfig {
-    /// Check if any provider key is configured.
+    /// Check if any provider configuration is set.
     pub fn has_any_key(&self) -> bool {
         self.anthropic_key.is_some()
             || self.openai_key.is_some()
@@ -99,7 +166,14 @@ impl LlmConfig {
             || self.deepseek_key.is_some()
             || self.xai_key.is_some()
             || self.mistral_key.is_some()
+            || self.ollama_key.is_some()
+            || self.ollama_base_url.is_some()
             || self.opencode_zen_key.is_some()
+            || self.nvidia_key.is_some()
+            || self.minimax_key.is_some()
+            || self.moonshot_key.is_some()
+            || self.zai_coding_plan_key.is_some()
+            || !self.providers.is_empty()
     }
 }
 
@@ -136,6 +210,16 @@ pub struct WebSearchProviderConfig {
     pub backend: WebSearchBackend,
     pub api_key: String,
 }
+
+const ANTHROPIC_PROVIDER_BASE_URL: &str = "https://api.anthropic.com";
+const OPENAI_PROVIDER_BASE_URL: &str = "https://api.openai.com";
+const OPENROUTER_PROVIDER_BASE_URL: &str = "https://openrouter.ai/api";
+const OPENCODE_ZEN_PROVIDER_BASE_URL: &str = "https://opencode.ai/zen";
+const MINIMAX_PROVIDER_BASE_URL: &str = "https://api.minimax.io/anthropic";
+const MOONSHOT_PROVIDER_BASE_URL: &str = "https://api.moonshot.ai";
+
+const ZHIPU_PROVIDER_BASE_URL: &str = "https://api.z.ai/api/paas/v4";
+const ZAI_CODING_PLAN_BASE_URL: &str = "https://api.z.ai/api/coding/paas/v4";
 
 /// Defaults inherited by all agents. Individual agents can override any field.
 #[derive(Debug, Clone)]
@@ -609,16 +693,21 @@ impl Binding {
                 .and_then(|v| v.as_u64())
                 .map(|v| v.to_string());
 
-            // Also check Slack channel IDs
+            // Also check Slack and Twitch channel IDs
             let slack_channel = message
                 .metadata
                 .get("slack_channel_id")
+                .and_then(|v| v.as_str());
+            let twitch_channel = message
+                .metadata
+                .get("twitch_channel")
                 .and_then(|v| v.as_str());
 
             let direct_match = message_channel
                 .as_ref()
                 .is_some_and(|id| self.channel_ids.contains(id))
-                || slack_channel.is_some_and(|id| self.channel_ids.contains(&id.to_string()));
+                || slack_channel.is_some_and(|id| self.channel_ids.contains(&id.to_string()))
+                || twitch_channel.is_some_and(|id| self.channel_ids.contains(&id.to_string()));
             let parent_match = parent_channel
                 .as_ref()
                 .is_some_and(|id| self.channel_ids.contains(id));
@@ -629,15 +718,12 @@ impl Binding {
         }
 
         if let Some(chat_id) = &self.chat_id {
-            let message_chat = message
-                .metadata
-                .get("telegram_chat_id")
-                .and_then(|value| {
-                    value
-                        .as_str()
-                        .map(std::borrow::ToOwned::to_owned)
-                        .or_else(|| value.as_i64().map(|id| id.to_string()))
-                });
+            let message_chat = message.metadata.get("telegram_chat_id").and_then(|value| {
+                value
+                    .as_str()
+                    .map(std::borrow::ToOwned::to_owned)
+                    .or_else(|| value.as_i64().map(|id| id.to_string()))
+            });
             if message_chat.as_deref() != Some(chat_id.as_str()) {
                 return false;
             }
@@ -671,6 +757,7 @@ pub struct MessagingConfig {
     pub slack: Option<SlackConfig>,
     pub telegram: Option<TelegramConfig>,
     pub webhook: Option<WebhookConfig>,
+    pub twitch: Option<TwitchConfig>,
 }
 
 #[derive(Debug, Clone)]
@@ -683,6 +770,20 @@ pub struct DiscordConfig {
     pub allow_bot_messages: bool,
 }
 
+/// A single slash command definition for the Slack adapter.
+///
+/// Maps a Slack slash command (e.g. `/ask`) to a target agent.
+/// Commands not listed here are acknowledged but produce a "not configured" reply.
+#[derive(Debug, Clone)]
+pub struct SlackCommandConfig {
+    /// The slash command string exactly as Slack sends it, e.g. `"/ask"`.
+    pub command: String,
+    /// ID of the agent that should handle this command.
+    pub agent_id: String,
+    /// Short description shown in Slack's command autocomplete hint (optional).
+    pub description: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct SlackConfig {
     pub enabled: bool,
@@ -690,6 +791,8 @@ pub struct SlackConfig {
     pub app_token: String,
     /// User IDs allowed to DM the bot. If empty, DMs are ignored entirely.
     pub dm_allowed_users: Vec<String>,
+    /// Slash command definitions. If empty, all slash commands are ignored.
+    pub commands: Vec<SlackCommandConfig>,
 }
 
 /// Hot-reloadable Discord permission filters.
@@ -888,6 +991,62 @@ impl TelegramPermissions {
 }
 
 #[derive(Debug, Clone)]
+pub struct TwitchConfig {
+    pub enabled: bool,
+    pub username: String,
+    pub oauth_token: String,
+    /// Channels to join (without the # prefix).
+    pub channels: Vec<String>,
+    /// Optional prefix that triggers the bot (e.g. "!ask"). If empty, all messages are processed.
+    pub trigger_prefix: Option<String>,
+}
+
+/// Hot-reloadable Twitch permission filters.
+///
+/// Shared with the Twitch adapter via `Arc<ArcSwap<..>>` for hot-reloading.
+#[derive(Debug, Clone, Default)]
+pub struct TwitchPermissions {
+    /// Allowed channel names (None = all joined channels accepted).
+    pub channel_filter: Option<Vec<String>>,
+    /// User login names allowed to interact with the bot. Empty = all users.
+    pub allowed_users: Vec<String>,
+}
+
+impl TwitchPermissions {
+    /// Build from the current config's twitch settings and bindings.
+    pub fn from_config(_twitch: &TwitchConfig, bindings: &[Binding]) -> Self {
+        let twitch_bindings: Vec<&Binding> =
+            bindings.iter().filter(|b| b.channel == "twitch").collect();
+
+        let channel_filter = {
+            let channel_ids: Vec<String> = twitch_bindings
+                .iter()
+                .flat_map(|b| b.channel_ids.clone())
+                .collect();
+            if channel_ids.is_empty() {
+                None
+            } else {
+                Some(channel_ids)
+            }
+        };
+
+        let mut allowed_users: Vec<String> = Vec::new();
+        for binding in &twitch_bindings {
+            for id in &binding.dm_allowed_users {
+                if !allowed_users.contains(id) {
+                    allowed_users.push(id.clone());
+                }
+            }
+        }
+
+        Self {
+            channel_filter,
+            allowed_users,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct WebhookConfig {
     pub enabled: bool,
     pub port: u16,
@@ -910,6 +1069,8 @@ struct TomlConfig {
     bindings: Vec<TomlBinding>,
     #[serde(default)]
     api: TomlApiConfig,
+    #[serde(default)]
+    metrics: TomlMetricsConfig,
     #[serde(default)]
     telemetry: TomlTelemetryConfig,
 }
@@ -952,7 +1113,68 @@ fn default_api_bind() -> String {
     "127.0.0.1".into()
 }
 
+#[derive(Deserialize)]
+struct TomlMetricsConfig {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default = "default_metrics_port")]
+    port: u16,
+    #[serde(default = "default_metrics_bind")]
+    bind: String,
+}
+
+impl Default for TomlMetricsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            port: default_metrics_port(),
+            bind: default_metrics_bind(),
+        }
+    }
+}
+
+fn default_metrics_port() -> u16 {
+    9090
+}
+fn default_metrics_bind() -> String {
+    "0.0.0.0".into()
+}
+
+#[derive(Deserialize, Debug)]
+struct TomlProviderConfig {
+    api_type: ApiType,
+    base_url: String,
+    api_key: String,
+    name: Option<String>,
+}
+
 #[derive(Deserialize, Default)]
+struct TomlLlmConfigFields {
+    anthropic_key: Option<String>,
+    openai_key: Option<String>,
+    openrouter_key: Option<String>,
+    zhipu_key: Option<String>,
+    groq_key: Option<String>,
+    together_key: Option<String>,
+    fireworks_key: Option<String>,
+    deepseek_key: Option<String>,
+    xai_key: Option<String>,
+    mistral_key: Option<String>,
+    ollama_key: Option<String>,
+    ollama_base_url: Option<String>,
+    opencode_zen_key: Option<String>,
+    nvidia_key: Option<String>,
+    minimax_key: Option<String>,
+    moonshot_key: Option<String>,
+    zai_coding_plan_key: Option<String>,
+    #[serde(default)]
+    providers: HashMap<String, TomlProviderConfig>,
+    #[serde(default)]
+    #[serde(flatten)]
+    extra: HashMap<String, toml::Value>,
+}
+
+#[derive(Default)]
 struct TomlLlmConfig {
     anthropic_key: Option<String>,
     openai_key: Option<String>,
@@ -964,7 +1186,67 @@ struct TomlLlmConfig {
     deepseek_key: Option<String>,
     xai_key: Option<String>,
     mistral_key: Option<String>,
+    ollama_key: Option<String>,
+    ollama_base_url: Option<String>,
     opencode_zen_key: Option<String>,
+    nvidia_key: Option<String>,
+    minimax_key: Option<String>,
+    moonshot_key: Option<String>,
+    zai_coding_plan_key: Option<String>,
+    providers: HashMap<String, TomlProviderConfig>,
+}
+
+impl<'de> Deserialize<'de> for TomlLlmConfig {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let mut fields = TomlLlmConfigFields::deserialize(deserializer)?;
+        let mut providers = fields.providers;
+
+        for (key, value) in fields.extra {
+            if key == "provider" {
+                let table = value
+                    .as_table()
+                    .ok_or_else(|| serde::de::Error::custom("`llm.provider` must be a table"))?;
+                for (provider_id, provider_value) in table {
+                    let provider_config = provider_value
+                        .clone()
+                        .try_into()
+                        .map_err(serde::de::Error::custom)?;
+                    providers.insert(provider_id.to_string(), provider_config);
+                }
+            }
+
+            if let Some(provider_id) = key.strip_prefix("provider.") {
+                let provider_config = value.try_into().map_err(serde::de::Error::custom)?;
+                providers.insert(provider_id.to_string(), provider_config);
+            }
+        }
+
+        fields.providers = providers;
+
+        Ok(Self {
+            anthropic_key: fields.anthropic_key,
+            openai_key: fields.openai_key,
+            openrouter_key: fields.openrouter_key,
+            zhipu_key: fields.zhipu_key,
+            groq_key: fields.groq_key,
+            together_key: fields.together_key,
+            fireworks_key: fields.fireworks_key,
+            deepseek_key: fields.deepseek_key,
+            xai_key: fields.xai_key,
+            mistral_key: fields.mistral_key,
+            ollama_key: fields.ollama_key,
+            ollama_base_url: fields.ollama_base_url,
+            opencode_zen_key: fields.opencode_zen_key,
+            nvidia_key: fields.nvidia_key,
+            minimax_key: fields.minimax_key,
+            moonshot_key: fields.moonshot_key,
+            zai_coding_plan_key: fields.zai_coding_plan_key,
+            providers: fields.providers,
+        })
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -1121,6 +1403,7 @@ struct TomlMessagingConfig {
     slack: Option<TomlSlackConfig>,
     telegram: Option<TomlTelegramConfig>,
     webhook: Option<TomlWebhookConfig>,
+    twitch: Option<TomlTwitchConfig>,
 }
 
 #[derive(Deserialize)]
@@ -1142,6 +1425,15 @@ struct TomlSlackConfig {
     app_token: Option<String>,
     #[serde(default)]
     dm_allowed_users: Vec<String>,
+    #[serde(default)]
+    commands: Vec<TomlSlackCommandConfig>,
+}
+
+#[derive(Deserialize)]
+struct TomlSlackCommandConfig {
+    command: String,
+    agent_id: String,
+    description: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1161,6 +1453,17 @@ struct TomlWebhookConfig {
     port: u16,
     #[serde(default = "default_webhook_bind")]
     bind: String,
+}
+
+#[derive(Deserialize)]
+struct TomlTwitchConfig {
+    #[serde(default)]
+    enabled: bool,
+    username: Option<String>,
+    oauth_token: Option<String>,
+    #[serde(default)]
+    channels: Vec<String>,
+    trigger_prefix: Option<String>,
 }
 
 fn default_webhook_port() -> u16 {
@@ -1264,18 +1567,46 @@ impl Config {
             })
     }
 
-    /// Check whether a first-run onboarding is needed (no config file and no env keys).
+    /// Check whether a first-run onboarding is needed (no config file and no env keys/providers).
     pub fn needs_onboarding() -> bool {
         let instance_dir = Self::default_instance_dir();
         let config_path = instance_dir.join("config.toml");
         if config_path.exists() {
             return false;
         }
-        // No config file — check if env vars can bootstrap
-        std::env::var("ANTHROPIC_API_KEY").is_err()
-            && std::env::var("OPENAI_API_KEY").is_err()
-            && std::env::var("OPENROUTER_API_KEY").is_err()
-            && std::env::var("OPENCODE_ZEN_API_KEY").is_err()
+
+        // Check if we have any legacy env keys configured
+        let has_legacy_keys = std::env::var("ANTHROPIC_API_KEY").is_ok()
+            || std::env::var("OPENAI_API_KEY").is_ok()
+            || std::env::var("OPENROUTER_API_KEY").is_ok()
+            || std::env::var("ZHIPU_API_KEY").is_ok()
+            || std::env::var("GROQ_API_KEY").is_ok()
+            || std::env::var("TOGETHER_API_KEY").is_ok()
+            || std::env::var("FIREWORKS_API_KEY").is_ok()
+            || std::env::var("DEEPSEEK_API_KEY").is_ok()
+            || std::env::var("XAI_API_KEY").is_ok()
+            || std::env::var("MISTRAL_API_KEY").is_ok()
+            || std::env::var("NVIDIA_API_KEY").is_ok()
+            || std::env::var("OLLAMA_API_KEY").is_ok()
+            || std::env::var("OLLAMA_BASE_URL").is_ok()
+            || std::env::var("OPENCODE_ZEN_API_KEY").is_ok()
+            || std::env::var("MINIMAX_API_KEY").is_ok()
+            || std::env::var("MOONSHOT_API_KEY").is_ok()
+            || std::env::var("ZAI_CODING_PLAN_API_KEY").is_ok();
+
+        // If we have any legacy keys, no onboarding needed
+        if has_legacy_keys {
+            return false;
+        }
+
+        // Check if we have any provider-specific env variables (provider.<name>.*)
+        let has_provider_env_vars = std::env::vars().any(|(key, _)| {
+            key.starts_with("SPACEBOT_PROVIDER_")
+                || key.starts_with("PROVIDER_")
+                || key.contains("PROVIDER") && key.contains("API_KEY")
+        });
+
+        !has_provider_env_vars
     }
 
     /// Load configuration from the default config file, falling back to env vars.
@@ -1308,7 +1639,7 @@ impl Config {
 
     /// Load from environment variables only (no config file).
     pub fn load_from_env(instance_dir: &Path) -> Result<Self> {
-        let llm = LlmConfig {
+        let mut llm = LlmConfig {
             anthropic_key: std::env::var("ANTHROPIC_API_KEY").ok(),
             openai_key: std::env::var("OPENAI_API_KEY").ok(),
             openrouter_key: std::env::var("OPENROUTER_API_KEY").ok(),
@@ -1319,8 +1650,104 @@ impl Config {
             deepseek_key: std::env::var("DEEPSEEK_API_KEY").ok(),
             xai_key: std::env::var("XAI_API_KEY").ok(),
             mistral_key: std::env::var("MISTRAL_API_KEY").ok(),
+            ollama_key: std::env::var("OLLAMA_API_KEY").ok(),
+            ollama_base_url: std::env::var("OLLAMA_BASE_URL").ok(),
             opencode_zen_key: std::env::var("OPENCODE_ZEN_API_KEY").ok(),
+            nvidia_key: std::env::var("NVIDIA_API_KEY").ok(),
+            minimax_key: std::env::var("MINIMAX_API_KEY").ok(),
+            moonshot_key: std::env::var("MOONSHOT_API_KEY").ok(),
+            zai_coding_plan_key: std::env::var("ZAI_CODING_PLAN_API_KEY").ok(),
+            providers: HashMap::new(),
         };
+
+        // Populate providers from env vars (same as from_toml does)
+        if let Some(anthropic_key) = llm.anthropic_key.clone() {
+            llm.providers
+                .entry("anthropic".to_string())
+                .or_insert_with(|| ProviderConfig {
+                    api_type: ApiType::Anthropic,
+                    base_url: ANTHROPIC_PROVIDER_BASE_URL.to_string(),
+                    api_key: anthropic_key,
+                    name: None,
+                });
+        }
+
+        if let Some(openai_key) = llm.openai_key.clone() {
+            llm.providers
+                .entry("openai".to_string())
+                .or_insert_with(|| ProviderConfig {
+                    api_type: ApiType::OpenAiCompletions,
+                    base_url: OPENAI_PROVIDER_BASE_URL.to_string(),
+                    api_key: openai_key,
+                    name: None,
+                });
+        }
+
+        if let Some(openrouter_key) = llm.openrouter_key.clone() {
+            llm.providers
+                .entry("openrouter".to_string())
+                .or_insert_with(|| ProviderConfig {
+                    api_type: ApiType::OpenAiCompletions,
+                    base_url: OPENROUTER_PROVIDER_BASE_URL.to_string(),
+                    api_key: openrouter_key,
+                    name: None,
+                });
+        }
+
+        if let Some(zhipu_key) = llm.zhipu_key.clone() {
+            llm.providers
+                .entry("zhipu".to_string())
+                .or_insert_with(|| ProviderConfig {
+                    api_type: ApiType::OpenAiCompletions,
+                    base_url: ZHIPU_PROVIDER_BASE_URL.to_string(),
+                    api_key: zhipu_key,
+                    name: None,
+                });
+        }
+
+        if let Some(zai_coding_plan_key) = llm.zai_coding_plan_key.clone() {
+            llm.providers
+                .entry("zai-coding-plan".to_string())
+                .or_insert_with(|| ProviderConfig {
+                    api_type: ApiType::OpenAiCompletions,
+                    base_url: ZAI_CODING_PLAN_BASE_URL.to_string(),
+                    api_key: zai_coding_plan_key,
+                    name: None,
+                });
+        }
+
+        if let Some(opencode_zen_key) = llm.opencode_zen_key.clone() {
+            llm.providers
+                .entry("opencode-zen".to_string())
+                .or_insert_with(|| ProviderConfig {
+                    api_type: ApiType::OpenAiCompletions,
+                    base_url: OPENCODE_ZEN_PROVIDER_BASE_URL.to_string(),
+                    api_key: opencode_zen_key,
+                    name: None,
+                });
+        }
+
+        if let Some(minimax_key) = llm.minimax_key.clone() {
+            llm.providers
+                .entry("minimax".to_string())
+                .or_insert_with(|| ProviderConfig {
+                    api_type: ApiType::Anthropic,
+                    base_url: MINIMAX_PROVIDER_BASE_URL.to_string(),
+                    api_key: minimax_key,
+                    name: None,
+                });
+        }
+
+        if let Some(moonshot_key) = llm.moonshot_key.clone() {
+            llm.providers
+                .entry("moonshot".to_string())
+                .or_insert_with(|| ProviderConfig {
+                    api_type: ApiType::OpenAiCompletions,
+                    base_url: MOONSHOT_PROVIDER_BASE_URL.to_string(),
+                    api_key: moonshot_key,
+                    name: None,
+                });
+        }
 
         // Note: We allow boot without provider keys now. System starts in setup mode.
         // Agents are initialized later when keys are added via API.
@@ -1364,6 +1791,7 @@ impl Config {
             messaging: MessagingConfig::default(),
             bindings: Vec::new(),
             api: ApiConfig::default(),
+            metrics: MetricsConfig::default(),
             telemetry: TelemetryConfig {
                 otlp_endpoint: std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok(),
                 otlp_headers: parse_otlp_headers(std::env::var("OTEL_EXPORTER_OTLP_HEADERS").ok())?,
@@ -1386,7 +1814,35 @@ impl Config {
     }
 
     fn from_toml(toml: TomlConfig, instance_dir: PathBuf) -> Result<Self> {
-        let llm = LlmConfig {
+        // Validate providers before processing
+        for (provider_id, config) in &toml.llm.providers {
+            // Validate provider_id
+            if provider_id.is_empty() || provider_id.len() > 64 {
+                return Err(ConfigError::Invalid(format!(
+                    "Provider ID '{}' must be between 1 and 64 characters long",
+                    provider_id
+                ))
+                .into());
+            }
+            if provider_id.contains('/') || provider_id.contains(char::is_whitespace) {
+                return Err(ConfigError::Invalid(format!(
+                    "Provider ID '{}' contains invalid characters (cannot contain '/' or whitespace)",
+                    provider_id
+                ))
+                .into());
+            }
+
+            // Validate base_url
+            if let Err(e) = reqwest::Url::parse(&config.base_url) {
+                return Err(ConfigError::Invalid(format!(
+                    "Invalid base URL '{}' for provider '{}': {}",
+                    config.base_url, provider_id, e
+                ))
+                .into());
+            }
+        }
+
+        let mut llm = LlmConfig {
             anthropic_key: toml
                 .llm
                 .anthropic_key
@@ -1447,13 +1903,154 @@ impl Config {
                 .as_deref()
                 .and_then(resolve_env_value)
                 .or_else(|| std::env::var("MISTRAL_API_KEY").ok()),
+            ollama_key: toml
+                .llm
+                .ollama_key
+                .as_deref()
+                .and_then(resolve_env_value)
+                .or_else(|| std::env::var("OLLAMA_API_KEY").ok()),
+            ollama_base_url: toml
+                .llm
+                .ollama_base_url
+                .as_deref()
+                .and_then(resolve_env_value)
+                .or_else(|| std::env::var("OLLAMA_BASE_URL").ok()),
             opencode_zen_key: toml
                 .llm
                 .opencode_zen_key
                 .as_deref()
                 .and_then(resolve_env_value)
                 .or_else(|| std::env::var("OPENCODE_ZEN_API_KEY").ok()),
+            nvidia_key: toml
+                .llm
+                .nvidia_key
+                .as_deref()
+                .and_then(resolve_env_value)
+                .or_else(|| std::env::var("NVIDIA_API_KEY").ok()),
+            minimax_key: toml
+                .llm
+                .minimax_key
+                .as_deref()
+                .and_then(resolve_env_value)
+                .or_else(|| std::env::var("MINIMAX_API_KEY").ok()),
+            moonshot_key: toml
+                .llm
+                .moonshot_key
+                .as_deref()
+                .and_then(resolve_env_value)
+                .or_else(|| std::env::var("MOONSHOT_API_KEY").ok()),
+            zai_coding_plan_key: toml
+                .llm
+                .zai_coding_plan_key
+                .as_deref()
+                .and_then(resolve_env_value)
+                .or_else(|| std::env::var("ZAI_CODING_PLAN_API_KEY").ok()),
+            providers: toml
+                .llm
+                .providers
+                .into_iter()
+                .map(|(provider_id, config)| {
+                    (
+                        provider_id.to_lowercase(),
+                        ProviderConfig {
+                            api_type: config.api_type,
+                            base_url: config.base_url,
+                            api_key: resolve_env_value(&config.api_key)
+                                .expect("Failed to resolve API key for provider"),
+                            name: config.name,
+                        },
+                    )
+                })
+                .collect(),
         };
+
+        if let Some(anthropic_key) = llm.anthropic_key.clone() {
+            llm.providers
+                .entry("anthropic".to_string())
+                .or_insert_with(|| ProviderConfig {
+                    api_type: ApiType::Anthropic,
+                    base_url: ANTHROPIC_PROVIDER_BASE_URL.to_string(),
+                    api_key: anthropic_key,
+                    name: None,
+                });
+        }
+
+        if let Some(openai_key) = llm.openai_key.clone() {
+            llm.providers
+                .entry("openai".to_string())
+                .or_insert_with(|| ProviderConfig {
+                    api_type: ApiType::OpenAiCompletions,
+                    base_url: OPENAI_PROVIDER_BASE_URL.to_string(),
+                    api_key: openai_key,
+                    name: None,
+                });
+        }
+
+        if let Some(openrouter_key) = llm.openrouter_key.clone() {
+            llm.providers
+                .entry("openrouter".to_string())
+                .or_insert_with(|| ProviderConfig {
+                    api_type: ApiType::OpenAiCompletions,
+                    base_url: OPENROUTER_PROVIDER_BASE_URL.to_string(),
+                    api_key: openrouter_key,
+                    name: None,
+                });
+        }
+
+        if let Some(zhipu_key) = llm.zhipu_key.clone() {
+            llm.providers
+                .entry("zhipu".to_string())
+                .or_insert_with(|| ProviderConfig {
+                    api_type: ApiType::OpenAiCompletions,
+                    base_url: ZHIPU_PROVIDER_BASE_URL.to_string(),
+                    api_key: zhipu_key,
+                    name: None,
+                });
+        }
+
+        if let Some(zai_coding_plan_key) = llm.zai_coding_plan_key.clone() {
+            llm.providers
+                .entry("zai-coding-plan".to_string())
+                .or_insert_with(|| ProviderConfig {
+                    api_type: ApiType::OpenAiCompletions,
+                    base_url: ZAI_CODING_PLAN_BASE_URL.to_string(),
+                    api_key: zai_coding_plan_key,
+                    name: None,
+                });
+        }
+
+        if let Some(opencode_zen_key) = llm.opencode_zen_key.clone() {
+            llm.providers
+                .entry("opencode-zen".to_string())
+                .or_insert_with(|| ProviderConfig {
+                    api_type: ApiType::OpenAiCompletions,
+                    base_url: OPENCODE_ZEN_PROVIDER_BASE_URL.to_string(),
+                    api_key: opencode_zen_key,
+                    name: None,
+                });
+        }
+
+        if let Some(minimax_key) = llm.minimax_key.clone() {
+            llm.providers
+                .entry("minimax".to_string())
+                .or_insert_with(|| ProviderConfig {
+                    api_type: ApiType::Anthropic,
+                    base_url: MINIMAX_PROVIDER_BASE_URL.to_string(),
+                    api_key: minimax_key,
+                    name: None,
+                });
+        }
+
+        if let Some(moonshot_key) = llm.moonshot_key.clone() {
+            llm.providers
+                .entry("moonshot".to_string())
+                .or_insert_with(|| ProviderConfig {
+                    api_type: ApiType::OpenAiCompletions,
+                    base_url: MOONSHOT_PROVIDER_BASE_URL.to_string(),
+                    api_key: moonshot_key,
+                    name: None,
+                });
+        }
 
         // Note: We allow boot without provider keys now. System starts in setup mode.
         // Agents are initialized later when keys are added via API.
@@ -1463,10 +2060,10 @@ impl Config {
             let r = toml.defaults.routing.as_ref();
             let missing: Vec<&str> = [
                 ("channel", r.and_then(|r| r.channel.as_ref())),
-                ("branch",  r.and_then(|r| r.branch.as_ref())),
-                ("worker",  r.and_then(|r| r.worker.as_ref())),
+                ("branch", r.and_then(|r| r.branch.as_ref())),
+                ("worker", r.and_then(|r| r.worker.as_ref())),
                 ("compactor", r.and_then(|r| r.compactor.as_ref())),
-                ("cortex",  r.and_then(|r| r.cortex.as_ref())),
+                ("cortex", r.and_then(|r| r.cortex.as_ref())),
             ]
             .into_iter()
             .filter_map(|(name, val)| if val.is_none() { Some(name) } else { None })
@@ -1477,7 +2074,8 @@ impl Config {
                     "missing required routing fields in [defaults.routing]: {}. \
                      All model fields must be explicitly set in config.toml.",
                     missing.join(", ")
-                )).into());
+                ))
+                .into());
             }
 
             // Require all known task types to be declared in [defaults.routing.task_overrides].
@@ -1485,11 +2083,7 @@ impl Config {
             let task_overrides = r.map(|r| &r.task_overrides);
             let missing_tasks: Vec<&str> = crate::llm::routing::REQUIRED_TASK_TYPES
                 .iter()
-                .filter(|&&t| {
-                    task_overrides
-                        .map(|ov| !ov.contains_key(t))
-                        .unwrap_or(true)
-                })
+                .filter(|&&t| task_overrides.map(|ov| !ov.contains_key(t)).unwrap_or(true))
                 .copied()
                 .collect();
 
@@ -1498,7 +2092,8 @@ impl Config {
                     "missing required task types in [defaults.routing.task_overrides]: {}. \
                      Set to \"none\" to use the process-type default for that task.",
                     missing_tasks.join(", ")
-                )).into());
+                ))
+                .into());
             }
         }
 
@@ -1883,6 +2478,15 @@ impl Config {
                     bot_token,
                     app_token,
                     dm_allowed_users: s.dm_allowed_users,
+                    commands: s
+                        .commands
+                        .into_iter()
+                        .map(|c| SlackCommandConfig {
+                            command: c.command,
+                            agent_id: c.agent_id,
+                            description: c.description,
+                        })
+                        .collect(),
                 })
             }),
             telegram: toml.messaging.telegram.and_then(|t| {
@@ -1901,6 +2505,25 @@ impl Config {
                 enabled: w.enabled,
                 port: w.port,
                 bind: w.bind,
+            }),
+            twitch: toml.messaging.twitch.and_then(|t| {
+                let username = t
+                    .username
+                    .as_deref()
+                    .and_then(resolve_env_value)
+                    .or_else(|| std::env::var("TWITCH_BOT_USERNAME").ok())?;
+                let oauth_token = t
+                    .oauth_token
+                    .as_deref()
+                    .and_then(resolve_env_value)
+                    .or_else(|| std::env::var("TWITCH_OAUTH_TOKEN").ok())?;
+                Some(TwitchConfig {
+                    enabled: t.enabled,
+                    username,
+                    oauth_token,
+                    channels: t.channels,
+                    trigger_prefix: t.trigger_prefix,
+                })
             }),
         };
 
@@ -1922,6 +2545,12 @@ impl Config {
             enabled: toml.api.enabled,
             port: toml.api.port,
             bind: toml.api.bind,
+        };
+
+        let metrics = MetricsConfig {
+            enabled: toml.metrics.enabled,
+            port: toml.metrics.port,
+            bind: toml.metrics.bind,
         };
 
         let telemetry = {
@@ -1955,6 +2584,7 @@ impl Config {
             messaging,
             bindings,
             api,
+            metrics,
             telemetry,
         })
     }
@@ -2096,8 +2726,9 @@ impl RuntimeConfig {
     /// Reload tunable config values from a freshly parsed Config.
     ///
     /// Finds the matching agent by ID, re-resolves it against defaults, and
-    /// swaps all reloadable fields. Ignores values that require a restart
-    /// (API keys, DB paths, messaging adapters, agent topology).
+    /// swaps all reloadable fields. Does not handle API keys (those are
+    /// reloaded via LlmManager), DB paths, messaging adapters, or agent
+    /// topology.
     pub fn reload_config(&self, config: &Config, agent_id: &str) {
         let agent = config.agents.iter().find(|a| a.id == agent_id);
         let Some(agent) = agent else {
@@ -2150,24 +2781,26 @@ impl RuntimeConfig {
     /// Resolve the currently active web search backend and key.
     pub fn web_search_provider(&self) -> Option<WebSearchProviderConfig> {
         match **self.web_search_backend.load() {
-            WebSearchBackend::Brave => self
-                .brave_search_key
-                .load()
-                .as_ref()
-                .clone()
-                .map(|api_key| WebSearchProviderConfig {
-                    backend: WebSearchBackend::Brave,
-                    api_key,
-                }),
-            WebSearchBackend::Perplexity => self
-                .perplexity_search_key
-                .load()
-                .as_ref()
-                .clone()
-                .map(|api_key| WebSearchProviderConfig {
-                    backend: WebSearchBackend::Perplexity,
-                    api_key,
-                }),
+            WebSearchBackend::Brave => {
+                self.brave_search_key
+                    .load()
+                    .as_ref()
+                    .clone()
+                    .map(|api_key| WebSearchProviderConfig {
+                        backend: WebSearchBackend::Brave,
+                        api_key,
+                    })
+            }
+            WebSearchBackend::Perplexity => {
+                self.perplexity_search_key
+                    .load()
+                    .as_ref()
+                    .clone()
+                    .map(|api_key| WebSearchProviderConfig {
+                        backend: WebSearchBackend::Perplexity,
+                        api_key,
+                    })
+            }
         }
     }
 }
@@ -2191,8 +2824,10 @@ pub fn spawn_file_watcher(
     discord_permissions: Option<Arc<arc_swap::ArcSwap<DiscordPermissions>>>,
     slack_permissions: Option<Arc<arc_swap::ArcSwap<SlackPermissions>>>,
     telegram_permissions: Option<Arc<arc_swap::ArcSwap<TelegramPermissions>>>,
+    twitch_permissions: Option<Arc<arc_swap::ArcSwap<TwitchPermissions>>>,
     bindings: Arc<arc_swap::ArcSwap<Vec<Binding>>>,
     messaging_manager: Option<Arc<crate::messaging::MessagingManager>>,
+    llm_manager: Arc<crate::llm::LlmManager>,
 ) -> tokio::task::JoinHandle<()> {
     use notify::{Event, RecursiveMode, Watcher};
     use std::time::Duration;
@@ -2347,8 +2982,10 @@ pub fn spawn_file_watcher(
                 None
             };
 
-            // Reload instance-level bindings and permissions
+            // Reload instance-level bindings, provider keys, and permissions
             if let Some(config) = &new_config {
+                llm_manager.reload_config(config.llm.clone());
+
                 bindings.store(Arc::new(config.bindings.clone()));
                 tracing::info!("bindings reloaded ({} entries)", config.bindings.len());
 
@@ -2379,6 +3016,15 @@ pub fn spawn_file_watcher(
                     }
                 }
 
+                if let Some(ref perms) = twitch_permissions {
+                    if let Some(twitch_config) = &config.messaging.twitch {
+                        let new_perms =
+                            TwitchPermissions::from_config(twitch_config, &config.bindings);
+                        perms.store(Arc::new(new_perms));
+                        tracing::info!("twitch permissions reloaded");
+                    }
+                }
+
                 // Hot-start adapters that are newly enabled in the config
                 if let Some(ref manager) = messaging_manager {
                     let rt = tokio::runtime::Handle::current();
@@ -2387,6 +3033,7 @@ pub fn spawn_file_watcher(
                     let discord_permissions = discord_permissions.clone();
                     let slack_permissions = slack_permissions.clone();
                     let telegram_permissions = telegram_permissions.clone();
+                    let twitch_permissions = twitch_permissions.clone();
 
                     rt.spawn(async move {
                         // Discord: start if enabled and not already running
@@ -2419,13 +3066,20 @@ pub fn spawn_file_watcher(
                                         Arc::new(arc_swap::ArcSwap::from_pointee(perms))
                                     }
                                 };
-                                let adapter = crate::messaging::slack::SlackAdapter::new(
+                                match crate::messaging::slack::SlackAdapter::new(
                                     &slack_config.bot_token,
                                     &slack_config.app_token,
                                     perms,
-                                );
-                                if let Err(error) = manager.register_and_start(adapter).await {
-                                    tracing::error!(%error, "failed to hot-start slack adapter from config change");
+                                    slack_config.commands.clone(),
+                                ) {
+                                    Ok(adapter) => {
+                                        if let Err(error) = manager.register_and_start(adapter).await {
+                                            tracing::error!(%error, "failed to hot-start slack adapter from config change");
+                                        }
+                                    }
+                                    Err(error) => {
+                                        tracing::error!(%error, "failed to build slack adapter from config change");
+                                    }
                                 }
                             }
                         }
@@ -2446,6 +3100,29 @@ pub fn spawn_file_watcher(
                                 );
                                 if let Err(error) = manager.register_and_start(adapter).await {
                                     tracing::error!(%error, "failed to hot-start telegram adapter from config change");
+                                }
+                            }
+                        }
+
+                        // Twitch: start if enabled and not already running
+                        if let Some(twitch_config) = &config.messaging.twitch {
+                            if twitch_config.enabled && !manager.has_adapter("twitch").await {
+                                let perms = match twitch_permissions {
+                                    Some(ref existing) => existing.clone(),
+                                    None => {
+                                        let perms = TwitchPermissions::from_config(twitch_config, &config.bindings);
+                                        Arc::new(arc_swap::ArcSwap::from_pointee(perms))
+                                    }
+                                };
+                                let adapter = crate::messaging::twitch::TwitchAdapter::new(
+                                    &twitch_config.username,
+                                    &twitch_config.oauth_token,
+                                    twitch_config.channels.clone(),
+                                    twitch_config.trigger_prefix.clone(),
+                                    perms,
+                                );
+                                if let Err(error) = manager.register_and_start(adapter).await {
+                                    tracing::error!(%error, "failed to hot-start twitch adapter from config change");
                                 }
                             }
                         }
@@ -2524,7 +3201,11 @@ pub fn run_onboarding() -> anyhow::Result<Option<PathBuf>> {
         "DeepSeek",
         "xAI (Grok)",
         "Mistral AI",
+        "Ollama",
         "OpenCode Zen",
+        "MiniMax",
+        "Moonshot AI (Kimi)",
+        "Z.AI Coding Plan",
     ];
     let provider_idx = Select::new()
         .with_prompt("Which LLM provider do you want to use?")
@@ -2532,7 +3213,7 @@ pub fn run_onboarding() -> anyhow::Result<Option<PathBuf>> {
         .default(0)
         .interact()?;
 
-    let (provider_key_name, toml_key, provider_id) = match provider_idx {
+    let (provider_input_name, toml_key, provider_id) = match provider_idx {
         0 => ("Anthropic API key", "anthropic_key", "anthropic"),
         1 => ("OpenRouter API key", "openrouter_key", "openrouter"),
         2 => ("OpenAI API key", "openai_key", "openai"),
@@ -2542,20 +3223,43 @@ pub fn run_onboarding() -> anyhow::Result<Option<PathBuf>> {
         6 => ("Fireworks AI API key", "fireworks_key", "fireworks"),
         7 => ("DeepSeek API key", "deepseek_key", "deepseek"),
         8 => ("xAI API key", "xai_key", "xai"),
-        9 => ("Mistral AI API key", "mistral_key", "mistral"),
-        10 => ("OpenCode Zen API key", "opencode_zen_key", "opencode-zen"),
+        9 => ("Mistral API key", "mistral_key", "mistral"),
+        10 => ("Ollama base URL (optional)", "ollama_base_url", "ollama"),
+        11 => ("OpenCode Zen API key", "opencode_zen_key", "opencode-zen"),
+        12 => ("MiniMax API key", "minimax_key", "minimax"),
+        13 => ("Moonshot API key", "moonshot_key", "moonshot"),
+        14 => (
+            "Z.AI Coding Plan API key",
+            "zai_coding_plan_key",
+            "zai-coding-plan",
+        ),
         _ => unreachable!(),
     };
+    let is_secret = provider_id != "ollama";
 
-    // 2. Get API key
-    let api_key: String = Password::new()
-        .with_prompt(format!("Enter your {provider_key_name}"))
-        .interact()?;
+    // 2. Get provider credential/endpoint
+    let provider_value = if is_secret {
+        let api_key: String = Password::new()
+            .with_prompt(format!("Enter your {provider_input_name}"))
+            .interact()?;
 
-    let api_key = api_key.trim().to_string();
-    if api_key.is_empty() {
-        anyhow::bail!("API key cannot be empty");
-    }
+        let api_key = api_key.trim().to_string();
+        if api_key.is_empty() {
+            anyhow::bail!("API key cannot be empty");
+        }
+        api_key
+    } else {
+        let base_url: String = Input::new()
+            .with_prompt(format!("Enter your {provider_input_name}"))
+            .default("http://localhost:11434".to_string())
+            .interact_text()?;
+
+        let base_url = base_url.trim().to_string();
+        if base_url.is_empty() {
+            anyhow::bail!("Ollama base URL cannot be empty");
+        }
+        base_url
+    };
 
     // 3. Agent name
     let agent_id: String = Input::new()
@@ -2648,7 +3352,7 @@ pub fn run_onboarding() -> anyhow::Result<Option<PathBuf>> {
 
     let mut config_content = String::new();
     config_content.push_str("[llm]\n");
-    config_content.push_str(&format!("{toml_key} = \"{api_key}\"\n"));
+    config_content.push_str(&format!("{toml_key} = \"{provider_value}\"\n"));
     config_content.push('\n');
 
     // Write routing defaults for the chosen provider
@@ -2712,4 +3416,306 @@ pub fn run_onboarding() -> anyhow::Result<Option<PathBuf>> {
     println!();
 
     Ok(Some(config_path))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::result::Result as StdResult;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    struct EnvGuard {
+        vars: Vec<(&'static str, Option<String>)>,
+        test_dir: PathBuf,
+    }
+
+    impl EnvGuard {
+        fn new() -> Self {
+            const KEYS: [&str; 4] = [
+                "SPACEBOT_DIR",
+                "ANTHROPIC_API_KEY",
+                "OPENAI_API_KEY",
+                "OPENROUTER_API_KEY",
+            ];
+
+            let vars = KEYS
+                .into_iter()
+                .map(|key| (key, std::env::var(key).ok()))
+                .collect::<Vec<_>>();
+
+            for key in KEYS {
+                unsafe {
+                    std::env::remove_var(key);
+                }
+            }
+
+            let unique = format!(
+                "spacebot-config-tests-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("system time before UNIX_EPOCH")
+                    .as_nanos()
+            );
+            let test_dir = std::env::temp_dir().join(unique);
+            std::fs::create_dir_all(&test_dir).expect("failed to create test dir");
+
+            unsafe {
+                std::env::set_var("SPACEBOT_DIR", &test_dir);
+            }
+
+            Self { vars, test_dir }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in &self.vars {
+                match value {
+                    Some(v) => unsafe { std::env::set_var(key, v) },
+                    None => unsafe { std::env::remove_var(key) },
+                }
+            }
+            let _ = std::fs::remove_dir_all(&self.test_dir);
+        }
+    }
+
+    #[test]
+    fn test_api_type_deserialization() {
+        let toml1 = r#"
+api_type = "openai_completions"
+base_url = "https://api.openai.com"
+api_key = "test-key"
+"#;
+        let result1: StdResult<TomlProviderConfig, toml::de::Error> = toml::from_str(toml1);
+        assert!(result1.is_ok(), "Error: {:?}", result1.err());
+        assert_eq!(result1.unwrap().api_type, ApiType::OpenAiCompletions);
+
+        let toml2 = r#"
+api_type = "openai_responses"
+base_url = "https://api.openai.com"
+api_key = "test-key"
+"#;
+        let result2: StdResult<TomlProviderConfig, toml::de::Error> = toml::from_str(toml2);
+        assert!(result2.is_ok(), "Error: {:?}", result2.err());
+        assert_eq!(result2.unwrap().api_type, ApiType::OpenAiResponses);
+
+        let toml3 = r#"
+api_type = "anthropic"
+base_url = "https://api.anthropic.com"
+api_key = "test-key"
+"#;
+        let result3: StdResult<TomlProviderConfig, toml::de::Error> = toml::from_str(toml3);
+        assert!(result3.is_ok(), "Error: {:?}", result3.err());
+        assert_eq!(result3.unwrap().api_type, ApiType::Anthropic);
+    }
+
+    #[test]
+    fn test_api_type_deserialization_invalid() {
+        let toml = r#"api_type = "invalid_type""#;
+        let result: StdResult<TomlProviderConfig, toml::de::Error> = toml::from_str(toml);
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert!(error.to_string().contains("invalid value"));
+        assert!(error.to_string().contains("openai_completions"));
+        assert!(error.to_string().contains("openai_responses"));
+        assert!(error.to_string().contains("anthropic"));
+    }
+
+    #[test]
+    fn test_provider_config_deserialization() {
+        let toml = r#"
+api_type = "anthropic"
+base_url = "https://api.anthropic.com/v1"
+api_key = "sk-ant-api03-abc123"
+name = "Anthropic"
+"#;
+        let result: StdResult<TomlProviderConfig, toml::de::Error> = toml::from_str(toml);
+        assert!(result.is_ok());
+        let config = result.unwrap();
+        assert_eq!(config.api_type, ApiType::Anthropic);
+        assert_eq!(config.base_url, "https://api.anthropic.com/v1");
+        assert_eq!(config.api_key, "sk-ant-api03-abc123");
+        assert_eq!(config.name, Some("Anthropic".to_string()));
+    }
+
+    #[test]
+    fn test_provider_config_deserialization_no_name() {
+        let toml = r#"
+api_type = "openai_responses"
+base_url = "https://api.openai.com/v1"
+api_key = "sk-proj-xyz789"
+"#;
+        let result: StdResult<TomlProviderConfig, toml::de::Error> = toml::from_str(toml);
+        assert!(result.is_ok());
+        let config = result.unwrap();
+        assert_eq!(config.api_type, ApiType::OpenAiResponses);
+        assert_eq!(config.base_url, "https://api.openai.com/v1");
+        assert_eq!(config.api_key, "sk-proj-xyz789");
+        assert_eq!(config.name, None);
+    }
+
+    #[test]
+    fn test_llm_provider_tables_parse_with_env_and_lowercase_keys() {
+        let toml = r#"
+[llm.provider.MyProv]
+api_type = "openai_responses"
+base_url = "https://api.example.com/v1"
+api_key = "env:PATH"
+
+[llm.provider.SecondProvider]
+api_type = "anthropic"
+base_url = "https://api.anthropic.com/v1"
+api_key = "static-provider-key"
+"#;
+
+        let parsed: TomlConfig = toml::from_str(toml).expect("failed to parse test TOML");
+        let config = Config::from_toml(parsed, PathBuf::from(".")).expect("failed to build Config");
+
+        assert_eq!(config.llm.providers.len(), 2);
+        assert!(config.llm.providers.contains_key("myprov"));
+        assert!(config.llm.providers.contains_key("secondprovider"));
+
+        let my_provider = config
+            .llm
+            .providers
+            .get("myprov")
+            .expect("myprov provider missing");
+        assert_eq!(my_provider.api_type, ApiType::OpenAiResponses);
+        assert_eq!(my_provider.base_url, "https://api.example.com/v1");
+        assert_eq!(
+            my_provider.api_key,
+            std::env::var("PATH").expect("PATH must exist for test")
+        );
+
+        let second_provider = config
+            .llm
+            .providers
+            .get("secondprovider")
+            .expect("secondprovider provider missing");
+        assert_eq!(second_provider.api_type, ApiType::Anthropic);
+        assert_eq!(second_provider.base_url, "https://api.anthropic.com/v1");
+        assert_eq!(second_provider.api_key, "static-provider-key");
+    }
+
+    #[test]
+    fn test_legacy_llm_keys_auto_migrate_to_providers() {
+        let toml = r#"
+[llm]
+anthropic_key = "legacy-anthropic-key"
+openai_key = "legacy-openai-key"
+openrouter_key = "legacy-openrouter-key"
+"#;
+
+        let parsed: TomlConfig = toml::from_str(toml).expect("failed to parse test TOML");
+        let config = Config::from_toml(parsed, PathBuf::from(".")).expect("failed to build Config");
+
+        let anthropic_provider = config
+            .llm
+            .providers
+            .get("anthropic")
+            .expect("anthropic provider missing");
+        assert_eq!(anthropic_provider.api_type, ApiType::Anthropic);
+        assert_eq!(anthropic_provider.base_url, ANTHROPIC_PROVIDER_BASE_URL);
+        assert_eq!(anthropic_provider.api_key, "legacy-anthropic-key");
+
+        let openai_provider = config
+            .llm
+            .providers
+            .get("openai")
+            .expect("openai provider missing");
+        assert_eq!(openai_provider.api_type, ApiType::OpenAiCompletions);
+        assert_eq!(openai_provider.base_url, OPENAI_PROVIDER_BASE_URL);
+        assert_eq!(openai_provider.api_key, "legacy-openai-key");
+
+        let openrouter_provider = config
+            .llm
+            .providers
+            .get("openrouter")
+            .expect("openrouter provider missing");
+        assert_eq!(openrouter_provider.api_type, ApiType::OpenAiCompletions);
+        assert_eq!(openrouter_provider.base_url, OPENROUTER_PROVIDER_BASE_URL);
+        assert_eq!(openrouter_provider.api_key, "legacy-openrouter-key");
+    }
+
+    #[test]
+    fn test_explicit_provider_config_takes_priority_over_legacy_key_migration() {
+        let toml = r#"
+[llm]
+openai_key = "legacy-openai-key"
+
+[llm.provider.openai]
+api_type = "openai_responses"
+base_url = "https://custom.openai.example/v1"
+api_key = "explicit-openai-key"
+name = "Custom OpenAI"
+"#;
+
+        let parsed: TomlConfig = toml::from_str(toml).expect("failed to parse test TOML");
+        let config = Config::from_toml(parsed, PathBuf::from(".")).expect("failed to build Config");
+
+        let openai_provider = config
+            .llm
+            .providers
+            .get("openai")
+            .expect("openai provider missing");
+        assert_eq!(openai_provider.api_type, ApiType::OpenAiResponses);
+        assert_eq!(openai_provider.base_url, "https://custom.openai.example/v1");
+        assert_eq!(openai_provider.api_key, "explicit-openai-key");
+        assert_eq!(openai_provider.name.as_deref(), Some("Custom OpenAI"));
+        assert_eq!(config.llm.openai_key.as_deref(), Some("legacy-openai-key"));
+    }
+
+    #[test]
+    fn test_needs_onboarding_without_config_or_env() {
+        let _lock = env_test_lock()
+            .lock()
+            .expect("failed to lock env test mutex");
+        let _env = EnvGuard::new();
+
+        assert!(Config::needs_onboarding());
+    }
+
+    #[test]
+    fn test_needs_onboarding_with_anthropic_env_key() {
+        let _lock = env_test_lock()
+            .lock()
+            .expect("failed to lock env test mutex");
+        let _env = EnvGuard::new();
+
+        unsafe {
+            std::env::set_var("ANTHROPIC_API_KEY", "test-key");
+        }
+
+        assert!(!Config::needs_onboarding());
+    }
+
+    #[test]
+    fn test_load_from_env_populates_legacy_key_and_provider() {
+        let _lock = env_test_lock()
+            .lock()
+            .expect("failed to lock env test mutex");
+        let _env = EnvGuard::new();
+
+        unsafe {
+            std::env::set_var("ANTHROPIC_API_KEY", "test-key");
+        }
+
+        let config = Config::load_from_env(&Config::default_instance_dir())
+            .expect("failed to load config from env");
+
+        assert_eq!(config.llm.anthropic_key.as_deref(), Some("test-key"));
+        let provider = config
+            .llm
+            .providers
+            .get("anthropic")
+            .expect("missing anthropic provider from env");
+        assert_eq!(provider.api_key, "test-key");
+        assert_eq!(provider.base_url, ANTHROPIC_PROVIDER_BASE_URL);
+    }
 }

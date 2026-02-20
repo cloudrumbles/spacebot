@@ -1,8 +1,7 @@
 import { useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { api, type CronJobWithStats, type CreateCronRequest } from "@/api/client";
-import { formatDuration, formatTimeAgo } from "@/lib/format";
-import { AnimatePresence, motion } from "framer-motion";
+import { formatTimeAgo } from "@/lib/format";
 import { Clock05Icon } from "@hugeicons/core-free-icons";
 import { HugeiconsIcon } from "@hugeicons/react";
 import {
@@ -16,39 +15,48 @@ import {
 	TextArea,
 	Toggle,
 	Label,
-	NumberStepper,
-	Select,
-	SelectTrigger,
-	SelectValue,
-	SelectContent,
-	SelectItem,
 } from "@/ui";
 
 // -- Helpers --
 
-function intervalToSeconds(value: number, unit: string): number {
-	switch (unit) {
-		case "minutes": return value * 60;
-		case "hours": return value * 3600;
-		case "days": return value * 86400;
-		default: return value;
-	}
+const SCHEDULE_EXAMPLES = [
+	{ label: "Daily at 9:00", value: "0 9 * * *" },
+	{ label: "Tuesday at 11:00", value: "0 11 * * 2" },
+	{ label: "Every 3 minutes", value: "*/3 * * * *" },
+] as const;
+
+const ONE_SHOT_PREFIX = "@once:";
+const ONE_SHOT_MINUTE_EXAMPLES = [
+	{ label: "Run once in 3m", minutes: 3 },
+	{ label: "Run once in 15m", minutes: 15 },
+	{ label: "Run once in 60m", minutes: 60 },
+] as const;
+
+function buildOneShotSchedule(minutesFromNow: number): string {
+	const runAt = new Date(Date.now() + minutesFromNow * 60_000);
+	return `${ONE_SHOT_PREFIX}${runAt.toISOString()}`;
 }
 
-function secondsToInterval(seconds: number): { value: number; unit: "minutes" | "hours" | "days" } {
-	if (seconds % 86400 === 0 && seconds >= 86400) return { value: seconds / 86400, unit: "days" };
-	if (seconds % 3600 === 0 && seconds >= 3600) return { value: seconds / 3600, unit: "hours" };
-	return { value: Math.max(1, Math.floor(seconds / 60)), unit: "minutes" };
+function formatScheduleDisplay(schedule: string): string {
+	const trimmedSchedule = schedule.trim();
+	if (!trimmedSchedule.startsWith(ONE_SHOT_PREFIX)) {
+		return trimmedSchedule;
+	}
+
+	const runAtRaw = trimmedSchedule.slice(ONE_SHOT_PREFIX.length);
+	const runAt = new Date(runAtRaw);
+	if (Number.isNaN(runAt.getTime())) {
+		return trimmedSchedule;
+	}
+
+	return `once at ${runAt.toLocaleString()}`;
 }
 
 interface CronFormData {
 	id: string;
 	prompt: string;
-	interval_value: number;
-	interval_unit: "minutes" | "hours" | "days";
+	schedule: string;
 	delivery_target: string;
-	active_start_hour: string;
-	active_end_hour: string;
 	enabled: boolean;
 }
 
@@ -56,39 +64,28 @@ function defaultFormData(): CronFormData {
 	return {
 		id: "",
 		prompt: "",
-		interval_value: 1,
-		interval_unit: "hours",
+		schedule: "0 * * * *",
 		delivery_target: "",
-		active_start_hour: "",
-		active_end_hour: "",
 		enabled: true,
 	};
 }
 
 function jobToFormData(job: CronJobWithStats): CronFormData {
-	const interval = secondsToInterval(job.interval_secs);
 	return {
 		id: job.id,
 		prompt: job.prompt,
-		interval_value: interval.value,
-		interval_unit: interval.unit,
+		schedule: job.schedule,
 		delivery_target: job.delivery_target,
-		active_start_hour: job.active_hours?.[0]?.toString() ?? "",
-		active_end_hour: job.active_hours?.[1]?.toString() ?? "",
 		enabled: job.enabled,
 	};
 }
 
 function formDataToRequest(data: CronFormData): CreateCronRequest {
-	const active_start = data.active_start_hour ? parseInt(data.active_start_hour, 10) : undefined;
-	const active_end = data.active_end_hour ? parseInt(data.active_end_hour, 10) : undefined;
 	return {
 		id: data.id,
 		prompt: data.prompt,
-		interval_secs: intervalToSeconds(data.interval_value, data.interval_unit),
+		schedule: data.schedule.trim(),
 		delivery_target: data.delivery_target,
-		active_start_hour: active_start,
-		active_end_hour: active_end,
 		enabled: data.enabled,
 	};
 }
@@ -161,7 +158,7 @@ export function AgentCron({ agentId }: AgentCronProps) {
 	};
 
 	const handleSave = () => {
-		if (!formData.id.trim() || !formData.prompt.trim() || !formData.delivery_target.trim()) return;
+		if (!formData.id.trim() || !formData.prompt.trim() || !formData.schedule.trim() || !formData.delivery_target.trim()) return;
 		saveMutation.mutate(formDataToRequest(formData));
 	};
 
@@ -277,38 +274,43 @@ export function AgentCron({ agentId }: AgentCronProps) {
 							/>
 						</Field>
 
-						<Field label="Interval">
-							<div className="flex items-center gap-2">
-								<span className="text-sm text-ink-faint">Every</span>
-								<NumberStepper
-									value={formData.interval_value}
-									onChange={(v) => setFormData((d) => ({ ...d, interval_value: v }))}
-									min={1}
-									max={999}
-									variant="compact"
-									suffix={` ${formData.interval_unit}`}
-								/>
-								<Select
-									value={formData.interval_unit}
-									onValueChange={(value) =>
-										setFormData((d) => ({ ...d, interval_unit: value as "minutes" | "hours" | "days" }))
-									}
-								>
-									<SelectTrigger className="w-32">
-										<SelectValue />
-									</SelectTrigger>
-									<SelectContent>
-										<SelectItem value="minutes">minutes</SelectItem>
-										<SelectItem value="hours">hours</SelectItem>
-										<SelectItem value="days">days</SelectItem>
-									</SelectContent>
-								</Select>
+						<Field label="Schedule (cron expression)">
+							<Input
+								value={formData.schedule}
+								onChange={(e) => setFormData((d) => ({ ...d, schedule: e.target.value }))}
+								placeholder="e.g. 0 9 * * *"
+								autoComplete="off"
+							/>
+							<div className="mt-2 flex flex-wrap gap-2">
+								{SCHEDULE_EXAMPLES.map((example) => (
+									<Button
+										key={example.value}
+										size="sm"
+										variant="ghost"
+										onClick={() => setFormData((d) => ({ ...d, schedule: example.value }))}
+									>
+										{example.label}
+									</Button>
+								))}
 							</div>
-							<p className="mt-1 text-tiny text-ink-faint">How often this job should run</p>
+							<div className="mt-2 flex flex-wrap gap-2">
+								{ONE_SHOT_MINUTE_EXAMPLES.map((example) => (
+									<Button
+										key={example.label}
+										size="sm"
+										variant="ghost"
+										onClick={() => setFormData((d) => ({ ...d, schedule: buildOneShotSchedule(example.minutes) }))}
+									>
+										{example.label}
+									</Button>
+								))}
+							</div>
+							<p className="mt-1 text-tiny text-ink-faint">
+								Use cron format (`minute hour day-of-month month day-of-week`) or one-shot format (`@once:&lt;RFC3339&gt;`).
+							</p>
 						</Field>
 
 						<div className="grid grid-cols-2 gap-4">
-
 							<Field label="Delivery Target">
 								<Input
 									value={formData.delivery_target}
@@ -318,47 +320,24 @@ export function AgentCron({ agentId }: AgentCronProps) {
 							</Field>
 						</div>
 
-						<Field label="Active Hours (optional)">
-							<div className="flex items-center gap-2">
-								<NumberStepper
-									value={parseInt(formData.active_start_hour) || 0}
-									onChange={(v) => setFormData((d) => ({ ...d, active_start_hour: v.toString() }))}
-									min={0}
-									max={23}
-									suffix="h"
-									variant="compact"
-								/>
-								<span className="text-sm text-ink-faint">to</span>
-								<NumberStepper
-									value={parseInt(formData.active_end_hour) || 23}
-									onChange={(v) => setFormData((d) => ({ ...d, active_end_hour: v.toString() }))}
-									min={0}
-									max={23}
-									suffix="h"
-									variant="compact"
-								/>
-							</div>
-							<p className="mt-1 text-tiny text-ink-faint">Job will only run during these hours (0-23, 24-hour format)</p>
-						</Field>
-
 						<div className="flex items-center justify-between">
 							<Label>Enabled</Label>
 							<Toggle checked={formData.enabled} onCheckedChange={(checked) => setFormData((d) => ({ ...d, enabled: checked }))} size="lg" />
 						</div>
 
-					<div className="mt-2 flex justify-end gap-2">
-						<Button variant="ghost" size="sm" onClick={closeModal}>
-							Cancel
-						</Button>
-						<Button
-							size="sm"
-							onClick={handleSave}
-							disabled={!formData.id.trim() || !formData.prompt.trim() || !formData.delivery_target.trim()}
-							loading={saveMutation.isPending}
-						>
-							{editingJob ? "Save Changes" : "Create Job"}
-						</Button>
-					</div>
+						<div className="mt-2 flex justify-end gap-2">
+							<Button variant="ghost" size="sm" onClick={closeModal}>
+								Cancel
+							</Button>
+							<Button
+								size="sm"
+								onClick={handleSave}
+								disabled={!formData.id.trim() || !formData.prompt.trim() || !formData.schedule.trim() || !formData.delivery_target.trim()}
+								loading={saveMutation.isPending}
+							>
+								{editingJob ? "Save Changes" : "Create Job"}
+							</Button>
+						</div>
 					</div>
 				</DialogContent>
 			</Dialog>
@@ -449,11 +428,9 @@ function CronJobCard({
 						<code className="rounded bg-app-lightBox px-1.5 py-0.5 text-xs font-medium text-ink">
 							{job.id}
 						</code>
-						{job.active_hours && (
-							<span className="text-tiny text-ink-faint">
-								{String(job.active_hours[0]).padStart(2, "0")}:00–{String(job.active_hours[1]).padStart(2, "0")}:00
-							</span>
-						)}
+						<code className="rounded bg-app-lightBox px-1.5 py-0.5 text-tiny text-ink-faint" title={job.schedule}>
+							{formatScheduleDisplay(job.schedule)}
+						</code>
 						{!job.enabled && (
 							<span className="rounded bg-gray-500/20 px-1.5 py-0.5 text-tiny text-gray-400">disabled</span>
 						)}
@@ -464,8 +441,6 @@ function CronJobCard({
 					</p>
 
 					<div className="flex flex-wrap items-center gap-3 text-tiny text-ink-faint">
-						<span>every {formatDuration(job.interval_secs)}</span>
-						<span className="text-ink-faint/50">·</span>
 						<span>{job.delivery_target}</span>
 						{job.last_executed_at && (
 							<>

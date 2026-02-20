@@ -6,13 +6,13 @@ use crate::{Attachment, InboundMessage, MessageContent, OutboundResponse, Status
 
 use anyhow::Context as _;
 use arc_swap::ArcSwap;
+use teloxide::Bot;
 use teloxide::payloads::setters::*;
 use teloxide::requests::{Request, Requester};
 use teloxide::types::{
     ChatAction, ChatId, FileId, InputFile, MediaKind, MessageId, MessageKind, ReactionType,
     ReplyParameters, UpdateKind, UserId,
 };
-use teloxide::Bot;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -48,10 +48,7 @@ const MAX_MESSAGE_LENGTH: usize = 4096;
 const STREAM_EDIT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1000);
 
 impl TelegramAdapter {
-    pub fn new(
-        token: impl Into<String>,
-        permissions: Arc<ArcSwap<TelegramPermissions>>,
-    ) -> Self {
+    pub fn new(token: impl Into<String>, permissions: Arc<ArcSwap<TelegramPermissions>>) -> Self {
         let token = token.into();
         let bot = Bot::new(&token);
         Self {
@@ -131,7 +128,7 @@ impl Messaging for TelegramAdapter {
                         tracing::info!("telegram polling loop shutting down");
                         break;
                     }
-                    result = bot.get_updates().offset(offset).timeout(30).send() => {
+                    result = bot.get_updates().offset(offset).timeout(10).send() => {
                         let updates = match result {
                             Ok(updates) => updates,
                             Err(error) => {
@@ -174,10 +171,8 @@ impl Messaging for TelegramAdapter {
                                         continue;
                                     }
                                 }
-                            }
-
-                            // Chat filter: if configured, only allow listed chats
-                            if let Some(filter) = &permissions.chat_filter {
+                            } else if let Some(filter) = &permissions.chat_filter {
+                                // Chat filter: if configured, only allow listed group/channel chats
                                 if !filter.contains(&chat_id) {
                                     continue;
                                 }
@@ -197,7 +192,7 @@ impl Messaging for TelegramAdapter {
                                 .map(|u| u.id.0.to_string())
                                 .unwrap_or_default();
 
-                            let metadata = build_metadata(
+                            let (metadata, formatted_author) = build_metadata(
                                 &message,
                                 &*bot_username.read().await,
                             );
@@ -211,6 +206,7 @@ impl Messaging for TelegramAdapter {
                                 content,
                                 timestamp: message.date,
                                 metadata,
+                                formatted_author,
                             };
 
                             if let Err(error) = inbound_tx.send(inbound).await {
@@ -249,7 +245,21 @@ impl Messaging for TelegramAdapter {
                         .context("failed to send telegram message")?;
                 }
             }
-            OutboundResponse::ThreadReply { thread_name: _, text } => {
+            OutboundResponse::RichMessage { text, .. } => {
+                self.stop_typing(&message.conversation_id).await;
+
+                for chunk in split_message(&text, MAX_MESSAGE_LENGTH) {
+                    self.bot
+                        .send_message(chat_id, &chunk)
+                        .send()
+                        .await
+                        .context("failed to send telegram message")?;
+                }
+            }
+            OutboundResponse::ThreadReply {
+                thread_name: _,
+                text,
+            } => {
                 self.stop_typing(&message.conversation_id).await;
 
                 // Telegram doesn't have named threads. Reply to the source message instead.
@@ -360,6 +370,24 @@ impl Messaging for TelegramAdapter {
             OutboundResponse::Status(status) => {
                 self.send_status(message, status).await?;
             }
+            // Slack-specific variants — graceful fallbacks for Telegram
+            OutboundResponse::RemoveReaction(_) => {} // no-op
+            OutboundResponse::Ephemeral { text, .. } => {
+                // Telegram has no ephemeral messages — send as regular text
+                let chat_id = self.extract_chat_id(message)?;
+                self.bot
+                    .send_message(chat_id, text)
+                    .await
+                    .context("failed to send ephemeral fallback on telegram")?;
+            }
+            OutboundResponse::ScheduledMessage { text, .. } => {
+                // Telegram has no scheduled messages — send immediately
+                let chat_id = self.extract_chat_id(message)?;
+                self.bot
+                    .send_message(chat_id, text)
+                    .await
+                    .context("failed to send scheduled message fallback on telegram")?;
+            }
         }
 
         Ok(())
@@ -380,8 +408,10 @@ impl Messaging for TelegramAdapter {
                 // Send one immediately, then repeat every 4 seconds.
                 let handle = tokio::spawn(async move {
                     loop {
-                        if let Err(error) =
-                            bot.send_chat_action(chat_id, ChatAction::Typing).send().await
+                        if let Err(error) = bot
+                            .send_chat_action(chat_id, ChatAction::Typing)
+                            .send()
+                            .await
                         {
                             tracing::debug!(%error, "failed to send typing indicator");
                             break;
@@ -403,11 +433,7 @@ impl Messaging for TelegramAdapter {
         Ok(())
     }
 
-    async fn broadcast(
-        &self,
-        target: &str,
-        response: OutboundResponse,
-    ) -> crate::Result<()> {
+    async fn broadcast(&self, target: &str, response: OutboundResponse) -> crate::Result<()> {
         let chat_id = ChatId(
             target
                 .parse::<i64>()
@@ -415,6 +441,14 @@ impl Messaging for TelegramAdapter {
         );
 
         if let OutboundResponse::Text(text) = response {
+            for chunk in split_message(&text, MAX_MESSAGE_LENGTH) {
+                self.bot
+                    .send_message(chat_id, &chunk)
+                    .send()
+                    .await
+                    .context("failed to broadcast telegram message")?;
+            }
+        } else if let OutboundResponse::RichMessage { text, .. } = response {
             for chunk in split_message(&text, MAX_MESSAGE_LENGTH) {
                 self.bot
                     .send_message(chat_id, &chunk)
@@ -644,7 +678,7 @@ async fn resolve_file_url(bot: &Bot, file_id: &str) -> anyhow::Result<String> {
 fn build_metadata(
     message: &teloxide::types::Message,
     bot_username: &Option<String>,
-) -> HashMap<String, serde_json::Value> {
+) -> (HashMap<String, serde_json::Value>, Option<String>) {
     let mut metadata = HashMap::new();
 
     metadata.insert(
@@ -673,19 +707,30 @@ fn build_metadata(
         metadata.insert("telegram_chat_title".into(), (*title).into());
     }
 
-    if let Some(from) = &message.from {
+    let formatted_author = if let Some(from) = &message.from {
         metadata.insert(
             "telegram_user_id".into(),
             serde_json::Value::Number(from.id.0.into()),
         );
 
         let display_name = build_display_name(from);
-        metadata.insert("display_name".into(), display_name.into());
+        metadata.insert("display_name".into(), display_name.clone().into());
+        metadata.insert("sender_display_name".into(), display_name.clone().into());
 
-        if let Some(username) = &from.username {
+        let author = if let Some(username) = &from.username {
             metadata.insert("telegram_username".into(), username.clone().into());
-        }
-    }
+            metadata.insert(
+                "telegram_user_mention".into(),
+                serde_json::Value::String(format!("@{}", username)),
+            );
+            format!("{} (@{})", display_name, username)
+        } else {
+            display_name
+        };
+        Some(author)
+    } else {
+        None
+    };
 
     if let Some(bot_username) = bot_username {
         metadata.insert("telegram_bot_username".into(), bot_username.clone().into());
@@ -706,14 +751,11 @@ fn build_metadata(
             metadata.insert("reply_to_text".into(), truncated.into());
         }
         if let Some(from) = &reply.from {
-            metadata.insert(
-                "reply_to_author".into(),
-                build_display_name(from).into(),
-            );
+            metadata.insert("reply_to_author".into(), build_display_name(from).into());
         }
     }
 
-    metadata
+    (metadata, formatted_author)
 }
 
 /// Build a display name from a Telegram user, preferring full name.

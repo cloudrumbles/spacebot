@@ -78,6 +78,28 @@ fn default_true() -> bool {
     true
 }
 
+const ONE_SHOT_PREFIX: &str = "@once:";
+
+/// Validate a schedule string.
+///
+/// Supported formats:
+/// - Cron expression (e.g. `0 9 * * *`)
+/// - One-shot absolute timestamp (`@once:2026-02-20T14:30:00Z`)
+pub fn validate_schedule(schedule: &str) -> std::result::Result<(), String> {
+    if parse_one_shot_timestamp(schedule)?.is_some() {
+        return Ok(());
+    }
+
+    croner::Cron::from_str(schedule)
+        .map(|_| ())
+        .map_err(|error| format!("invalid cron expression '{schedule}': {error}"))
+}
+
+/// Whether the schedule string uses one-shot semantics.
+pub fn is_one_shot_schedule(schedule: &str) -> bool {
+    schedule.trim().starts_with(ONE_SHOT_PREFIX)
+}
+
 /// Context needed to execute a cron job (agent resources + messaging).
 ///
 /// Prompts, identity, browser config, and skills are read from
@@ -181,39 +203,29 @@ impl Scheduler {
                     break;
                 }
 
-                // Parse the cron expression and find next occurrence.
-                let cron = match croner::Cron::from_str(&schedule_expr) {
-                    Ok(cron) => cron,
+                let now = chrono::Local::now();
+
+                // Parse schedule and compute next occurrence.
+                let (next, is_one_shot) = match next_occurrence(&schedule_expr, now) {
+                    Ok(value) => value,
                     Err(error) => {
                         tracing::error!(
                             cron_id = %job_id,
                             schedule = %schedule_expr,
-                            %error,
-                            "invalid cron expression, stopping timer"
+                            error = %error,
+                            "invalid schedule, stopping timer"
                         );
                         break;
                     }
                 };
 
-                let now = chrono::Local::now();
-                let next = match cron.find_next_occurrence(&now, false) {
-                    Ok(next) => next,
-                    Err(error) => {
-                        tracing::error!(
-                            cron_id = %job_id,
-                            %error,
-                            "failed to compute next cron occurrence, stopping timer"
-                        );
-                        break;
-                    }
-                };
-
-                let duration_until = (next - now).to_std().unwrap_or(Duration::from_secs(60));
+                let duration_until = (next - now).to_std().unwrap_or(Duration::from_secs(0));
                 tracing::debug!(
                     cron_id = %job_id,
                     next_fire = %next.format("%Y-%m-%d %H:%M:%S %Z"),
                     secs_until = duration_until.as_secs(),
-                    "sleeping until next cron occurrence"
+                    one_shot = is_one_shot,
+                    "sleeping until next schedule occurrence"
                 );
 
                 tokio::time::sleep(duration_until).await;
@@ -236,7 +248,26 @@ impl Scheduler {
 
                 tracing::info!(cron_id = %job_id, "cron job firing");
 
-                match run_cron_job(&job, &context).await {
+                let run_result = run_cron_job(&job, &context).await;
+
+                if is_one_shot {
+                    tracing::info!(cron_id = %job_id, "one-shot cron job completed; disabling");
+
+                    {
+                        let mut j = jobs.write().await;
+                        if let Some(job) = j.get_mut(&job_id) {
+                            job.enabled = false;
+                        }
+                    }
+
+                    if let Err(error) = context.store.update_enabled(&job_id, false).await {
+                        tracing::error!(%error, cron_id = %job_id, "failed to persist one-shot disabled state");
+                    }
+
+                    break;
+                }
+
+                match run_result {
                     Ok(()) => {
                         // Reset failure count on success
                         let mut j = jobs.write().await;
@@ -344,13 +375,28 @@ impl Scheduler {
 
         if let Some(job) = job {
             if !job.enabled {
-                return Err(crate::error::Error::Other(
-                    anyhow::anyhow!("cron job is disabled"),
-                ));
+                return Err(crate::error::Error::Other(anyhow::anyhow!(
+                    "cron job is disabled"
+                )));
             }
 
             tracing::info!(cron_id = %job_id, "cron job triggered manually");
-            run_cron_job(&job, &self.context).await
+            let run_result = run_cron_job(&job, &self.context).await;
+
+            if is_one_shot_schedule(&job.schedule) {
+                tracing::info!(cron_id = %job_id, "one-shot cron job was manually triggered; disabling");
+                {
+                    let mut jobs = self.jobs.write().await;
+                    if let Some(existing_job) = jobs.get_mut(job_id) {
+                        existing_job.enabled = false;
+                    }
+                }
+                if let Err(error) = self.context.store.update_enabled(job_id, false).await {
+                    tracing::error!(%error, cron_id = %job_id, "failed to persist one-shot disabled state");
+                }
+            }
+
+            run_result
         } else {
             Err(crate::error::Error::Other(anyhow::anyhow!(
                 "cron job not found"
@@ -386,6 +432,44 @@ impl Scheduler {
 
         Ok(())
     }
+}
+
+fn parse_one_shot_timestamp(
+    schedule: &str,
+) -> std::result::Result<Option<chrono::DateTime<chrono::Local>>, String> {
+    let trimmed_schedule = schedule.trim();
+    if !trimmed_schedule.starts_with(ONE_SHOT_PREFIX) {
+        return Ok(None);
+    }
+
+    let raw_timestamp = trimmed_schedule
+        .strip_prefix(ONE_SHOT_PREFIX)
+        .unwrap_or_default()
+        .trim();
+    if raw_timestamp.is_empty() {
+        return Err("missing RFC3339 timestamp after '@once:'".to_string());
+    }
+
+    let timestamp = chrono::DateTime::parse_from_rfc3339(raw_timestamp)
+        .map_err(|error| format!("invalid one-shot timestamp '{raw_timestamp}': {error}"))?;
+
+    Ok(Some(timestamp.with_timezone(&chrono::Local)))
+}
+
+fn next_occurrence(
+    schedule: &str,
+    now: chrono::DateTime<chrono::Local>,
+) -> std::result::Result<(chrono::DateTime<chrono::Local>, bool), String> {
+    if let Some(run_at) = parse_one_shot_timestamp(schedule)? {
+        return Ok((run_at, true));
+    }
+
+    let cron = croner::Cron::from_str(schedule)
+        .map_err(|error| format!("invalid cron expression '{schedule}': {error}"))?;
+    let next = cron
+        .find_next_occurrence(&now, false)
+        .map_err(|error| format!("failed to compute next cron occurrence: {error}"))?;
+    Ok((next, false))
 }
 
 /// Execute a single cron job: create a fresh channel, run the prompt, deliver the result.
@@ -425,6 +509,7 @@ async fn run_cron_job(job: &CronJob, context: &CronContext) -> Result<()> {
         content: MessageContent::Text(job.prompt.clone()),
         timestamp: chrono::Utc::now(),
         metadata: HashMap::new(),
+        formatted_author: None,
     };
 
     channel_tx
@@ -445,6 +530,9 @@ async fn run_cron_job(job: &CronJob, context: &CronContext) -> Result<()> {
     loop {
         match tokio::time::timeout(timeout, response_rx.recv()).await {
             Ok(Some(OutboundResponse::Text(text))) => {
+                collected_text.push(text);
+            }
+            Ok(Some(OutboundResponse::RichMessage { text, .. })) => {
                 collected_text.push(text);
             }
             Ok(Some(_)) => {
@@ -474,11 +562,7 @@ async fn run_cron_job(job: &CronJob, context: &CronContext) -> Result<()> {
     } else {
         None
     };
-    if let Err(error) = context
-        .store
-        .log_execution(&job.id, true, summary)
-        .await
-    {
+    if let Err(error) = context.store.log_execution(&job.id, true, summary).await {
         tracing::warn!(%error, "failed to log cron execution");
     }
 

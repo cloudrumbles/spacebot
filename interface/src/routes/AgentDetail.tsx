@@ -3,7 +3,8 @@ import { Link } from "@tanstack/react-router";
 import { useQuery } from "@tanstack/react-query";
 import { api, type CortexEvent, type CronJobInfo, MEMORY_TYPES } from "@/api/client";
 import type { ChannelLiveState } from "@/hooks/useChannelLiveState";
-import { formatTimeAgo, formatDuration } from "@/lib/format";
+import { formatTimeAgo } from "@/lib/format";
+import { DeleteAgentDialog } from "@/components/DeleteAgentDialog";
 import {
 	ResponsiveContainer,
 	AreaChart,
@@ -20,6 +21,23 @@ import {
 interface AgentDetailProps {
 	agentId: string;
 	liveStates: Record<string, ChannelLiveState>;
+}
+
+const ONE_SHOT_PREFIX = "@once:";
+
+function formatScheduleDisplay(schedule: string): string {
+	const trimmedSchedule = schedule.trim();
+	if (!trimmedSchedule.startsWith(ONE_SHOT_PREFIX)) {
+		return trimmedSchedule;
+	}
+
+	const runAtRaw = trimmedSchedule.slice(ONE_SHOT_PREFIX.length);
+	const runAt = new Date(runAtRaw);
+	if (Number.isNaN(runAt.getTime())) {
+		return trimmedSchedule;
+	}
+
+	return `once at ${runAt.toLocaleString()}`;
 }
 
 export function AgentDetail({ agentId, liveStates }: AgentDetailProps) {
@@ -74,6 +92,8 @@ export function AgentDetail({ agentId, liveStates }: AgentDetailProps) {
 		return { workers, branches, typing };
 	}, [agentChannels, liveStates]);
 
+	const [deleteOpen, setDeleteOpen] = useState(false);
+
 	if (!agent) {
 		return (
 			<div className="flex h-full items-center justify-center">
@@ -94,7 +114,9 @@ export function AgentDetail({ agentId, liveStates }: AgentDetailProps) {
 					workers={activity.workers}
 					branches={activity.branches}
 					hasLiveActivity={hasLiveActivity}
+					onDelete={() => setDeleteOpen(true)}
 				/>
+				<DeleteAgentDialog open={deleteOpen} onOpenChange={setDeleteOpen} agentId={agentId} />
 
 				{/* Bulletin - the most important text */}
 				{overviewData?.latest_bulletin && (
@@ -207,12 +229,14 @@ function HeroSection({
 	workers,
 	branches,
 	hasLiveActivity,
+	onDelete,
 }: {
 	agentId: string;
 	channelCount: number;
 	workers: number;
 	branches: number;
 	hasLiveActivity: boolean;
+	onDelete: () => void;
 }) {
 	return (
 		<div className="flex flex-col gap-4 border-b border-app-line pb-6">
@@ -233,6 +257,12 @@ function HeroSection({
 						</Link>
 					</div>
 				</div>
+				<button
+					onClick={onDelete}
+					className="rounded-md px-3 py-1.5 text-sm text-ink-faint transition-colors hover:bg-red-500/10 hover:text-red-400"
+				>
+					Delete
+				</button>
 			</div>
 
 			{(workers > 0 || branches > 0) && (
@@ -675,13 +705,8 @@ function CronSection({ agentId, jobs }: { agentId: string; jobs: CronJobInfo[] }
 							{job.prompt}
 						</span>
 						<span className="text-tiny tabular-nums text-ink-faint">
-							every {formatDuration(job.interval_secs)}
+							{formatScheduleDisplay(job.schedule)}
 						</span>
-						{job.active_hours && (
-							<span className="text-tiny text-ink-faint">
-								{job.active_hours[0]}:00–{job.active_hours[1]}:00
-							</span>
-						)}
 						<span className="text-tiny text-ink-faint">{job.delivery_target}</span>
 					</div>
 				))}
