@@ -120,6 +120,17 @@ pub fn truncate_output(value: &str, max_bytes: usize) -> String {
     )
 }
 
+fn infer_delivery_target_from_conversation_id(conversation_id: &str) -> Option<String> {
+    let (adapter, target) = conversation_id.split_once(':')?;
+    if adapter.is_empty() || target.is_empty() {
+        return None;
+    }
+    if adapter == "cron" || adapter == "system" {
+        return None;
+    }
+    Some(format!("{adapter}:{target}"))
+}
+
 /// Add per-turn tools to a channel's ToolServer.
 ///
 /// Called when a conversation turn begins. These tools hold per-turn state
@@ -134,6 +145,9 @@ pub async fn add_channel_tools(
     cron_tool: Option<CronTool>,
     tool_search: Option<ToolSearchTool>,
 ) -> Result<(), rig::tool::server::ToolServerError> {
+    let conversation_id = conversation_id.into();
+    let default_delivery_target = infer_delivery_target_from_conversation_id(&conversation_id);
+
     handle
         .add_tool(ReplyTool::new(
             response_tx.clone(),
@@ -163,7 +177,9 @@ pub async fn add_channel_tools(
         .await?;
     handle.add_tool(ReactTool::new(response_tx)).await?;
     if let Some(cron) = cron_tool {
-        handle.add_tool(cron).await?;
+        handle
+            .add_tool(cron.with_default_delivery_target(default_delivery_target))
+            .await?;
     }
     if let Some(ts) = tool_search {
         handle.add_tool(ts).await?;

@@ -147,22 +147,67 @@ impl Tool for SpawnWorkerTool {
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": properties,
-                "required": ["task"]
+                "required": ["task"],
+                "allOf": if opencode_enabled {
+                    vec![
+                        serde_json::json!({
+                            "if": {
+                                "properties": {
+                                    "worker_type": { "const": "opencode" }
+                                },
+                                "required": ["worker_type"]
+                            },
+                            "then": {
+                                "required": ["task", "directory"]
+                            }
+                        })
+                    ]
+                } else {
+                    vec![]
+                }
             }),
         }
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        let is_opencode = args.worker_type.as_deref() == Some("opencode");
+        let task = args.task.trim();
+        if task.is_empty() {
+            return Err(SpawnWorkerError("'task' must not be empty".into()));
+        }
+
+        let worker_type = args.worker_type.as_deref().unwrap_or("builtin");
+        let opencode_enabled = self.state.deps.runtime_config.opencode.load().enabled;
+
+        let is_opencode = match worker_type {
+            "builtin" => false,
+            "opencode" => {
+                if !opencode_enabled {
+                    return Err(SpawnWorkerError(
+                        "opencode workers are disabled in this agent config".into(),
+                    ));
+                }
+                true
+            }
+            other => {
+                return Err(SpawnWorkerError(format!(
+                    "unknown worker_type '{other}'. Use 'builtin' or 'opencode'."
+                )));
+            }
+        };
 
         let worker_id = if is_opencode {
+            if args.skill.is_some() {
+                return Err(SpawnWorkerError(
+                    "skill is only supported for builtin workers; include extra instructions in task for opencode workers".into(),
+                ));
+            }
             let directory = args.directory.as_deref().ok_or_else(|| {
                 SpawnWorkerError("directory is required for opencode workers".into())
             })?;
 
             spawn_opencode_worker_from_state(
                 &self.state,
-                &args.task,
+                task,
                 directory,
                 args.interactive,
                 args.task_type.as_deref(),
@@ -172,7 +217,7 @@ impl Tool for SpawnWorkerTool {
         } else {
             spawn_worker_from_state(
                 &self.state,
-                &args.task,
+                task,
                 args.interactive,
                 args.skill.as_deref(),
                 args.task_type.as_deref(),
@@ -184,13 +229,13 @@ impl Tool for SpawnWorkerTool {
         let worker_type_label = if is_opencode { "OpenCode" } else { "builtin" };
         let message = if args.interactive {
             format!(
-                "Interactive {worker_type_label} worker {worker_id} spawned for: {}. Route follow-ups with route_to_worker.",
-                args.task
+                "Interactive {worker_type_label} worker {worker_id} spawned for: {}. Route follow-ups with route.",
+                task
             )
         } else {
             format!(
                 "{worker_type_label} worker {worker_id} spawned for: {}. It will report back when done.",
-                args.task
+                task
             )
         };
 

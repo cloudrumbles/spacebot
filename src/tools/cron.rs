@@ -14,11 +14,21 @@ use std::sync::Arc;
 pub struct CronTool {
     store: Arc<CronStore>,
     scheduler: Arc<Scheduler>,
+    default_delivery_target: Option<String>,
 }
 
 impl CronTool {
     pub fn new(store: Arc<CronStore>, scheduler: Arc<Scheduler>) -> Self {
-        Self { store, scheduler }
+        Self {
+            store,
+            scheduler,
+            default_delivery_target: None,
+        }
+    }
+
+    pub fn with_default_delivery_target(mut self, delivery_target: Option<String>) -> Self {
+        self.default_delivery_target = delivery_target;
+        self
     }
 }
 
@@ -39,8 +49,9 @@ pub struct CronArgs {
     /// Required for "create": a cron expression defining the schedule (e.g. "0 9 * * *" for daily at 9am).
     #[serde(default)]
     pub schedule: Option<String>,
-    /// Required for "create": where to deliver results, in "adapter:target" format (e.g. "telegram:525365593").
-    #[serde(default)]
+    /// Legacy optional override for destination target.
+    /// If omitted, the cron tool defaults to the current channel target.
+    #[serde(default, alias = "channel_id")]
     pub delivery_target: Option<String>,
     /// Required for "delete": the ID of the cron job to remove.
     #[serde(default)]
@@ -95,16 +106,39 @@ impl Tool for CronTool {
                         "type": "string",
                         "description": "For 'create': either a cron expression (e.g. '0 9 * * *' for daily at 9am, '*/5 * * * *' for every 5 minutes) or a one-shot timestamp ('@once:2026-02-20T14:30:00Z')."
                     },
-                    "delivery_target": {
-                        "type": "string",
-                        "description": "For 'create': where to send results, format 'adapter:target' (e.g. 'telegram:525365593')."
-                    },
                     "delete_id": {
                         "type": "string",
                         "description": "For 'delete': the ID of the cron job to remove."
                     }
                 },
-                "required": ["action"]
+                "required": ["action"],
+                "allOf": [
+                    {
+                        "if": {
+                            "properties": {
+                                "action": { "const": "create" }
+                            },
+                            "required": ["action"]
+                        },
+                        "then": {
+                            "required": ["action", "id", "prompt", "schedule"]
+                        }
+                    },
+                    {
+                        "if": {
+                            "properties": {
+                                "action": { "const": "delete" }
+                            },
+                            "required": ["action"]
+                        },
+                        "then": {
+                            "anyOf": [
+                                { "required": ["delete_id"] },
+                                { "required": ["id"] }
+                            ]
+                        }
+                    }
+                ]
             }),
         }
     }
@@ -136,7 +170,13 @@ impl CronTool {
             .ok_or_else(|| CronError("'schedule' is required for create".into()))?;
         let delivery_target = args
             .delivery_target
-            .ok_or_else(|| CronError("'delivery_target' is required for create".into()))?;
+            .or_else(|| self.default_delivery_target.clone())
+            .ok_or_else(|| {
+                CronError(
+                    "unable to infer delivery target for create; this tool must run in a messaging channel"
+                        .into(),
+                )
+            })?;
 
         validate_schedule(&schedule)
             .map_err(|error| CronError(format!("invalid schedule '{schedule}': {error}")))?;

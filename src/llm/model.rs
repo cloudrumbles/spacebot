@@ -1127,17 +1127,28 @@ fn truncate_body(body: &str) -> &str {
 
 // --- Response parsing ---
 
-fn make_tool_call(id: String, name: String, arguments: serde_json::Value) -> ToolCall {
+fn make_tool_call_with_metadata(
+    id: String,
+    call_id: Option<String>,
+    name: String,
+    arguments: serde_json::Value,
+    signature: Option<String>,
+    additional_params: Option<serde_json::Value>,
+) -> ToolCall {
     ToolCall {
         id,
-        call_id: None,
+        call_id,
         function: ToolFunction {
             name: name.trim().to_string(),
             arguments,
         },
-        signature: None,
-        additional_params: None,
+        signature,
+        additional_params,
     }
+}
+
+fn make_tool_call(id: String, name: String, arguments: serde_json::Value) -> ToolCall {
+    make_tool_call_with_metadata(id, None, name, arguments, None, None)
 }
 
 fn parse_anthropic_response(
@@ -1236,6 +1247,10 @@ pub(crate) fn parse_openai_response(
     if let Some(tool_calls) = choice["tool_calls"].as_array() {
         for tc in tool_calls {
             let id = tc["id"].as_str().unwrap_or("").to_string();
+            let call_id = tc["call_id"]
+                .as_str()
+                .or_else(|| tc["callId"].as_str())
+                .map(|value| value.to_string());
             let name = tc["function"]["name"].as_str().unwrap_or("").to_string();
             // OpenAI-compatible APIs usually return arguments as a JSON string.
             // Some providers return it as a raw JSON object instead.
@@ -1245,8 +1260,23 @@ pub(crate) fn parse_openai_response(
                 .and_then(|raw| serde_json::from_str(raw).ok())
                 .or_else(|| arguments_field.as_object().map(|_| arguments_field.clone()))
                 .unwrap_or(serde_json::json!({}));
-            assistant_content.push(AssistantContent::ToolCall(make_tool_call(
-                id, name, arguments,
+            let signature = tc["signature"]
+                .as_str()
+                .or_else(|| tc["thought_signature"].as_str())
+                .or_else(|| tc["thoughtSignature"].as_str())
+                .map(|value| value.to_string());
+            let additional_params = tc
+                .get("additional_params")
+                .or_else(|| tc.get("additionalParams"))
+                .filter(|value| !value.is_null())
+                .cloned();
+            assistant_content.push(AssistantContent::ToolCall(make_tool_call_with_metadata(
+                id,
+                call_id,
+                name,
+                arguments,
+                signature,
+                additional_params,
             )));
         }
     }
