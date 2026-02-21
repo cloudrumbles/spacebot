@@ -5,7 +5,7 @@ use crate::llm::routing::RoutingConfig;
 use anyhow::Context as _;
 use arc_swap::ArcSwap;
 use serde::{Deserialize, Deserializer};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -151,6 +151,7 @@ pub struct LlmConfig {
     pub moonshot_key: Option<String>,
     pub zai_coding_plan_key: Option<String>,
     pub google_antigravity_key: Option<String>,
+    pub gemini_key: Option<String>,
     pub providers: HashMap<String, ProviderConfig>,
 }
 
@@ -175,6 +176,7 @@ impl LlmConfig {
             || self.moonshot_key.is_some()
             || self.zai_coding_plan_key.is_some()
             || self.google_antigravity_key.is_some()
+            || self.gemini_key.is_some()
             || !self.providers.is_empty()
     }
 }
@@ -222,6 +224,7 @@ const MOONSHOT_PROVIDER_BASE_URL: &str = "https://api.moonshot.ai";
 const GOOGLE_ANTIGRAVITY_PROVIDER_BASE_URL: &str =
     "https://daily-cloudcode-pa.sandbox.googleapis.com";
 
+const GEMINI_PROVIDER_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta/openai";
 const ZHIPU_PROVIDER_BASE_URL: &str = "https://api.z.ai/api/paas/v4";
 const ZAI_CODING_PLAN_BASE_URL: &str = "https://api.z.ai/api/coding/paas/v4";
 const NVIDIA_PROVIDER_BASE_URL: &str = "https://integrate.api.nvidia.com";
@@ -1227,6 +1230,7 @@ struct TomlLlmConfigFields {
     moonshot_key: Option<String>,
     zai_coding_plan_key: Option<String>,
     google_antigravity_key: Option<String>,
+    gemini_key: Option<String>,
     #[serde(default)]
     providers: HashMap<String, TomlProviderConfig>,
     #[serde(default)]
@@ -1254,6 +1258,7 @@ struct TomlLlmConfig {
     moonshot_key: Option<String>,
     zai_coding_plan_key: Option<String>,
     google_antigravity_key: Option<String>,
+    gemini_key: Option<String>,
     providers: HashMap<String, TomlProviderConfig>,
 }
 
@@ -1306,6 +1311,7 @@ impl<'de> Deserialize<'de> for TomlLlmConfig {
             moonshot_key: fields.moonshot_key,
             zai_coding_plan_key: fields.zai_coding_plan_key,
             google_antigravity_key: fields.google_antigravity_key,
+            gemini_key: fields.gemini_key,
             providers: fields.providers,
         })
     }
@@ -1643,6 +1649,46 @@ fn resolve_routing(toml: Option<TomlRoutingConfig>, base: &RoutingConfig) -> Rou
     }
 }
 
+/// For google-antigravity routing entries, auto-inject openrouter fallbacks
+/// when the user has openrouter credentials configured and no explicit
+/// fallbacks are set. Model mapping: strip `google-antigravity/` prefix,
+/// strip `-thinking` suffix, prepend `openrouter/anthropic/`.
+///
+/// For other fallback providers (e.g. gemini), configure explicitly in
+/// config.toml under `[defaults.routing]` `fallbacks`.
+fn inject_antigravity_fallbacks(routing: &mut RoutingConfig, llm: &LlmConfig) {
+    if !llm.providers.contains_key("openrouter") {
+        return;
+    }
+
+    let models: Vec<String> = [
+        &routing.channel,
+        &routing.branch,
+        &routing.worker,
+        &routing.compactor,
+        &routing.cortex,
+    ]
+    .into_iter()
+    .chain(routing.task_overrides.values())
+    .filter(|m| m.starts_with("google-antigravity/"))
+    .cloned()
+    .collect::<HashSet<_>>()
+    .into_iter()
+    .collect();
+
+    for model in models {
+        if routing.fallbacks.contains_key(&model) {
+            continue;
+        }
+        let bare = model
+            .strip_prefix("google-antigravity/")
+            .unwrap_or(&model);
+        let bare = bare.strip_suffix("-thinking").unwrap_or(bare);
+        let fallback = format!("openrouter/anthropic/{bare}");
+        routing.fallbacks.insert(model, vec![fallback]);
+    }
+}
+
 impl Config {
     /// Resolve the instance directory from env or default (~/.spacebot).
     pub fn default_instance_dir() -> PathBuf {
@@ -1686,7 +1732,8 @@ impl Config {
             || std::env::var("MINIMAX_API_KEY").is_ok()
             || std::env::var("MOONSHOT_API_KEY").is_ok()
             || std::env::var("ZAI_CODING_PLAN_API_KEY").is_ok()
-            || std::env::var("GOOGLE_ANTIGRAVITY_API_KEY").is_ok();
+            || std::env::var("GOOGLE_ANTIGRAVITY_API_KEY").is_ok()
+            || std::env::var("GEMINI_API_KEY").is_ok();
 
         // If we have any legacy keys, no onboarding needed
         if has_legacy_keys {
@@ -1759,6 +1806,7 @@ impl Config {
             moonshot_key: std::env::var("MOONSHOT_API_KEY").ok(),
             zai_coding_plan_key: std::env::var("ZAI_CODING_PLAN_API_KEY").ok(),
             google_antigravity_key: std::env::var("GOOGLE_ANTIGRAVITY_API_KEY").ok(),
+            gemini_key: std::env::var("GEMINI_API_KEY").ok(),
             providers: HashMap::new(),
         };
 
@@ -1858,6 +1906,17 @@ impl Config {
                     api_type: ApiType::OpenAiCompletions,
                     base_url: GOOGLE_ANTIGRAVITY_PROVIDER_BASE_URL.to_string(),
                     api_key: google_antigravity_key,
+                    name: None,
+                });
+        }
+
+        if let Some(gemini_key) = llm.gemini_key.clone() {
+            llm.providers
+                .entry("gemini".to_string())
+                .or_insert_with(|| ProviderConfig {
+                    api_type: ApiType::OpenAiCompletions,
+                    base_url: GEMINI_PROVIDER_BASE_URL.to_string(),
+                    api_key: gemini_key,
                     name: None,
                 });
         }
@@ -2075,6 +2134,12 @@ impl Config {
                 .as_deref()
                 .and_then(resolve_env_value)
                 .or_else(|| std::env::var("GOOGLE_ANTIGRAVITY_API_KEY").ok()),
+            gemini_key: toml
+                .llm
+                .gemini_key
+                .as_deref()
+                .and_then(resolve_env_value)
+                .or_else(|| std::env::var("GEMINI_API_KEY").ok()),
             providers: toml
                 .llm
                 .providers
@@ -2193,6 +2258,17 @@ impl Config {
                 });
         }
 
+        if let Some(gemini_key) = llm.gemini_key.clone() {
+            llm.providers
+                .entry("gemini".to_string())
+                .or_insert_with(|| ProviderConfig {
+                    api_type: ApiType::OpenAiCompletions,
+                    base_url: GEMINI_PROVIDER_BASE_URL.to_string(),
+                    api_key: gemini_key,
+                    name: None,
+                });
+        }
+
         if let Some(nvidia_key) = llm.nvidia_key.clone() {
             llm.providers
                 .entry("nvidia".to_string())
@@ -2256,8 +2332,11 @@ impl Config {
         } else {
             base_defaults.web_search_backend
         };
+        let mut routing = resolve_routing(toml.defaults.routing, &base_defaults.routing);
+        inject_antigravity_fallbacks(&mut routing, &llm);
+
         let defaults = DefaultsConfig {
-            routing: resolve_routing(toml.defaults.routing, &base_defaults.routing),
+            routing,
             max_concurrent_branches: toml
                 .defaults
                 .max_concurrent_branches

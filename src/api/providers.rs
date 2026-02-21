@@ -298,6 +298,7 @@ fn build_test_llm_config(provider: &str, credential: &str) -> crate::config::Llm
         moonshot_key: (provider == "moonshot").then(|| credential.to_string()),
         zai_coding_plan_key: (provider == "zai-coding-plan").then(|| credential.to_string()),
         google_antigravity_key: (provider == "google-antigravity").then(|| credential.to_string()),
+        gemini_key: (provider == "gemini").then(|| credential.to_string()),
         providers,
     }
 }

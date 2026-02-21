@@ -345,6 +345,7 @@ pub fn provider_to_prefix(provider: &str) -> &str {
         "moonshot" => "moonshot/",
         "zai-coding-plan" => "zai-coding-plan/",
         "google-antigravity" => "google-antigravity/",
+        "gemini" => "gemini/",
         _ => "",
     }
 }
