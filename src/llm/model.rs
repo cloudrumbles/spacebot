@@ -1167,9 +1167,15 @@ fn parse_anthropic_response(
             Some("thinking") | Some("redacted_thinking") => {
                 // These are provider-side reasoning blocks. They can appear without a
                 // final text/tool block, which previously caused an empty-response error.
+                tracing::debug!("skipping thinking block in Anthropic response");
                 saw_thinking_block = true;
             }
-            _ => {}
+            _ => {
+                tracing::debug!(
+                    "skipping unknown block type in Anthropic response: {:?}",
+                    block["type"].as_str()
+                );
+            }
         }
     }
 
