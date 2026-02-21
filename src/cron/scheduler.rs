@@ -417,6 +417,57 @@ impl Scheduler {
 
     /// Update a job's enabled state and manage its timer accordingly.
     pub async fn set_enabled(&self, job_id: &str, enabled: bool) -> Result<()> {
+        // Try to find the job in the in-memory HashMap.
+        let in_memory = {
+            let jobs = self.jobs.read().await;
+            jobs.contains_key(job_id)
+        };
+
+        if !in_memory {
+            if !enabled {
+                tracing::debug!(cron_id = %job_id, "set_enabled(false): job not in scheduler, nothing to do");
+                return Ok(());
+            }
+
+            // Cold re-enable: job was disabled at startup so was never loaded into the scheduler.
+            // Reload from the store, insert, then start the timer.
+            tracing::info!(cron_id = %job_id, "cold re-enable: reloading config from store");
+            let configs = self.context.store.load_all_unfiltered().await?;
+            let config = configs
+                .into_iter()
+                .find(|c| c.id == job_id)
+                .ok_or_else(|| {
+                    crate::error::Error::Other(anyhow::anyhow!("cron job not found in store"))
+                })?;
+
+            let delivery_target =
+                DeliveryTarget::parse(&config.delivery_target).unwrap_or_else(|| DeliveryTarget {
+                    adapter: "unknown".into(),
+                    target: config.delivery_target.clone(),
+                });
+
+            {
+                let mut jobs = self.jobs.write().await;
+                jobs.insert(
+                    job_id.to_string(),
+                    CronJob {
+                        id: config.id.clone(),
+                        prompt: config.prompt,
+                        schedule: config.schedule,
+                        delivery_target,
+                        enabled: true,
+                        run_once: config.run_once,
+                        consecutive_failures: 0,
+                        timeout_secs: config.timeout_secs,
+                    },
+                );
+            }
+
+            self.start_timer(job_id).await;
+            tracing::info!(cron_id = %job_id, "cron job cold-re-enabled and timer started");
+            return Ok(());
+        }
+
         let was_enabled = {
             let mut jobs = self.jobs.write().await;
             if let Some(job) = jobs.get_mut(job_id) {

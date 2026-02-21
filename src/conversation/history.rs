@@ -229,7 +229,7 @@ impl ProcessRunLogger {
 
         tokio::spawn(async move {
             if let Err(error) = sqlx::query(
-                "INSERT INTO branch_runs (id, channel_id, description) VALUES (?, ?, ?)",
+                "INSERT OR IGNORE INTO branch_runs (id, channel_id, description) VALUES (?, ?, ?)",
             )
             .bind(&id)
             .bind(&channel_id)
@@ -275,13 +275,14 @@ impl ProcessRunLogger {
         let task = task.to_string();
 
         tokio::spawn(async move {
-            if let Err(error) =
-                sqlx::query("INSERT INTO worker_runs (id, channel_id, task) VALUES (?, ?, ?)")
-                    .bind(&id)
-                    .bind(&channel_id)
-                    .bind(&task)
-                    .execute(&pool)
-                    .await
+            if let Err(error) = sqlx::query(
+                "INSERT OR IGNORE INTO worker_runs (id, channel_id, task) VALUES (?, ?, ?)",
+            )
+            .bind(&id)
+            .bind(&channel_id)
+            .bind(&task)
+            .execute(&pool)
+            .await
             {
                 tracing::warn!(%error, worker_id = %id, "failed to persist worker start");
             }
