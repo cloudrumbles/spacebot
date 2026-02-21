@@ -77,10 +77,17 @@ impl SpacebotModel {
             .map(|(provider, _)| provider)
             .unwrap_or("anthropic");
 
-        let provider_config = self
+        let mut provider_config = self
             .llm_manager
             .get_provider(provider_id)
             .map_err(|e| CompletionError::ProviderError(e.to_string()))?;
+
+        // For Anthropic, prefer OAuth token from auth.json over static config key
+        if provider_id == "anthropic" {
+            if let Ok(Some(token)) = self.llm_manager.get_anthropic_token().await {
+                provider_config.api_key = token;
+            }
+        }
 
         if provider_id == "google-antigravity" {
             return google_antigravity::call_completion(
