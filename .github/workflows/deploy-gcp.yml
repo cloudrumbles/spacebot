@@ -1,0 +1,79 @@
+name: Deploy to GCP
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  GCP_PROJECT: braided-trees-486900-v1
+  GCP_ZONE: asia-southeast1-b
+  INSTANCE: sultana-claw
+  CONTAINER: spacebot
+  IMAGE_TAG: spacebot-local:deploy
+
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build slim image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: slim
+          tags: ${{ env.IMAGE_TAG }}
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Save and compress image
+        run: docker save ${{ env.IMAGE_TAG }} | gzip > /tmp/spacebot-deploy.tar.gz
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Transfer image to instance
+        run: |
+          gcloud compute scp /tmp/spacebot-deploy.tar.gz \
+            ${{ env.INSTANCE }}:/tmp/spacebot-deploy.tar.gz \
+            --zone=${{ env.GCP_ZONE }} \
+            --project=${{ env.GCP_PROJECT }}
+
+      - name: Deploy on instance
+        run: |
+          gcloud compute ssh ${{ env.INSTANCE }} \
+            --zone=${{ env.GCP_ZONE }} \
+            --project=${{ env.GCP_PROJECT }} \
+            --command='
+              sudo docker load < /tmp/spacebot-deploy.tar.gz
+              sudo docker stop ${{ env.CONTAINER }} 2>/dev/null || true
+              sudo docker rm ${{ env.CONTAINER }} 2>/dev/null || true
+              sudo docker run -d \
+                --name ${{ env.CONTAINER }} \
+                --restart unless-stopped \
+                -p 19898:19898 \
+                -v /home/shah/.spacebot:/data \
+                --env-file /home/shah/.spacebot/.env \
+                ${{ env.IMAGE_TAG }}
+              rm /tmp/spacebot-deploy.tar.gz
+            '
+
+      - name: Health check
+        run: |
+          sleep 35
+          gcloud compute ssh ${{ env.INSTANCE }} \
+            --zone=${{ env.GCP_ZONE }} \
+            --project=${{ env.GCP_PROJECT }} \
+            --command='sudo docker ps --filter name=${{ env.CONTAINER }} --format "{{.Status}}" | grep -q healthy'
