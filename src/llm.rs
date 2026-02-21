@@ -1,5 +1,6 @@
 //! LLM provider management and routing.
 
+pub mod anthropic;
 pub(crate) mod google_antigravity;
 pub mod manager;
 pub mod model;

@@ -343,59 +343,27 @@ impl SpacebotModel {
         request: CompletionRequest,
         provider_config: &ProviderConfig,
     ) -> Result<completion::CompletionResponse<RawResponse>, CompletionError> {
-        let base_url = provider_config.base_url.trim_end_matches('/');
-        let messages_url = format!("{base_url}/v1/messages");
         let api_key = provider_config.api_key.as_str();
 
-        let messages = convert_messages_to_anthropic(&request.chat_history);
+        let effort = self
+            .routing
+            .as_ref()
+            .map(|r| r.thinking_effort_for_model(&self.model_name))
+            .unwrap_or("auto");
+        let anthropic_request = crate::llm::anthropic::build_anthropic_request(
+            self.llm_manager.http_client(),
+            &api_key,
+            &self.model_name,
+            &request,
+            effort,
+        );
 
-        let mut body = serde_json::json!({
-            "model": self.model_name,
-            "messages": messages,
-            "max_tokens": request.max_tokens.unwrap_or(4096),
-        });
+        let is_oauth =
+            anthropic_request.auth_path == crate::llm::anthropic::AnthropicAuthPath::OAuthToken;
+        let original_tools = anthropic_request.original_tools;
 
-        if let Some(preamble) = &request.preamble {
-            body["system"] = serde_json::json!(preamble);
-        }
-
-        if let Some(temperature) = request.temperature {
-            body["temperature"] = serde_json::json!(temperature);
-        }
-
-        if !request.tools.is_empty() {
-            let tools: Vec<serde_json::Value> = request
-                .tools
-                .iter()
-                .map(|t| {
-                    serde_json::json!({
-                        "name": t.name,
-                        "description": t.description,
-                        "input_schema": t.parameters,
-                    })
-                })
-                .collect();
-            body["tools"] = serde_json::json!(tools);
-        }
-
-        let is_oauth = api_key.starts_with("sk-ant-oat");
-        let mut req = self
-            .llm_manager
-            .http_client()
-            .post(&messages_url)
-            .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json");
-
-        if is_oauth {
-            req = req
-                .header("authorization", format!("Bearer {api_key}"))
-                .header("anthropic-beta", "oauth-2025-04-20");
-        } else {
-            req = req.header("x-api-key", api_key);
-        }
-
-        let response = req
-            .json(&body)
+        let response = anthropic_request
+            .builder
             .send()
             .await
             .map_err(|e| CompletionError::ProviderError(e.to_string()))?;
@@ -422,7 +390,14 @@ impl SpacebotModel {
             )));
         }
 
-        parse_anthropic_response(response_body)
+        let mut completion = parse_anthropic_response(response_body)?;
+
+        // Reverse-map tool names when using OAuth (Claude Code canonical → original)
+        if is_oauth && !original_tools.is_empty() {
+            reverse_map_tool_names(&mut completion, &original_tools);
+        }
+
+        Ok(completion)
     }
 
     async fn call_openai(
@@ -809,6 +784,20 @@ fn normalize_ollama_base_url(configured: Option<String>) -> String {
     base_url
 }
 
+/// Reverse-map Claude Code canonical tool names back to the original names
+/// from the request's tool definitions.
+fn reverse_map_tool_names(
+    completion: &mut completion::CompletionResponse<RawResponse>,
+    original_tools: &[(String, String)],
+) {
+    for content in completion.choice.iter_mut() {
+        if let AssistantContent::ToolCall(tc) = content {
+            tc.function.name =
+                crate::llm::anthropic::from_claude_code_name(&tc.function.name, original_tools);
+        }
+    }
+}
+
 fn tool_result_content_to_string(content: &OneOrMany<rig::message::ToolResultContent>) -> String {
     content
         .iter()
@@ -822,7 +811,7 @@ fn tool_result_content_to_string(content: &OneOrMany<rig::message::ToolResultCon
 
 // --- Message conversion ---
 
-fn convert_messages_to_anthropic(messages: &OneOrMany<Message>) -> Vec<serde_json::Value> {
+pub fn convert_messages_to_anthropic(messages: &OneOrMany<Message>) -> Vec<serde_json::Value> {
     messages
         .iter()
         .map(|message| match message {
@@ -1374,4 +1363,48 @@ fn parse_openai_responses_response(
         },
         raw_response: RawResponse { body },
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reverse_map_restores_original_tool_names() {
+        let original_tools = vec![
+            ("my_read".to_string(), "reads files".to_string()),
+            ("my_bash".to_string(), "runs commands".to_string()),
+        ];
+
+        let mut completion = completion::CompletionResponse {
+            choice: OneOrMany::one(AssistantContent::ToolCall(ToolCall {
+                id: "tc1".into(),
+                call_id: None,
+                function: ToolFunction {
+                    name: "My_Read".into(),
+                    arguments: serde_json::json!({}),
+                },
+                signature: None,
+                additional_params: None,
+            })),
+            usage: completion::Usage {
+                input_tokens: 0,
+                output_tokens: 0,
+                total_tokens: 0,
+                cached_input_tokens: 0,
+            },
+            raw_response: RawResponse {
+                body: serde_json::json!({}),
+            },
+        };
+
+        reverse_map_tool_names(&mut completion, &original_tools);
+
+        let first = completion.choice.first_ref();
+        if let AssistantContent::ToolCall(tc) = first {
+            assert_eq!(tc.function.name, "my_read");
+        } else {
+            panic!("expected ToolCall");
+        }
+    }
 }
