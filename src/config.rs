@@ -492,6 +492,8 @@ pub struct CronDef {
     /// Delivery target in "adapter:target" format (e.g. "telegram:525365593").
     pub delivery_target: String,
     pub enabled: bool,
+    pub run_once: bool,
+    pub timeout_secs: Option<u64>,
 }
 
 /// Fully resolved agent config (merged with defaults, paths resolved).
@@ -1411,6 +1413,9 @@ struct TomlCronDef {
     delivery_target: String,
     #[serde(default = "default_enabled")]
     enabled: bool,
+    #[serde(default)]
+    run_once: bool,
+    timeout_secs: Option<u64>,
 }
 
 fn default_schedule() -> String {
@@ -2411,6 +2416,8 @@ impl Config {
                         schedule: h.schedule,
                         delivery_target: h.delivery_target,
                         enabled: h.enabled,
+                        run_once: h.run_once,
+                        timeout_secs: h.timeout_secs,
                     })
                     .collect();
 

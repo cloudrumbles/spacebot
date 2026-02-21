@@ -1,4 +1,4 @@
-Manage scheduled tasks (cron jobs). Use this to create, list, or delete cron jobs. A cron job runs a prompt on a schedule and delivers the result to a messaging channel.
+Manage scheduled tasks (cron jobs). Use this to create, list, or delete cron jobs. A cron job runs a prompt on a schedule and delivers the result to a messaging channel. Use `run_once: true` for one-time reminders; otherwise jobs are recurring. Use `timeout_secs` (default 120) for long-running tasks.
 
 Action requirements:
 - `action: "create"` requires: `id`, `prompt`, `schedule`

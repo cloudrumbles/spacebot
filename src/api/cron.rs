@@ -34,6 +34,9 @@ pub(super) struct CreateCronRequest {
     delivery_target: String,
     #[serde(default = "default_enabled")]
     enabled: bool,
+    #[serde(default)]
+    run_once: bool,
+    timeout_secs: Option<u64>,
 }
 
 fn default_schedule() -> String {
@@ -185,6 +188,8 @@ pub(super) async fn create_or_update_cron(
         schedule: request.schedule,
         delivery_target: request.delivery_target,
         enabled: request.enabled,
+        run_once: request.run_once,
+        timeout_secs: request.timeout_secs,
     };
 
     store.save(&config).await.map_err(|error| {
