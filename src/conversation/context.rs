@@ -19,6 +19,7 @@ pub async fn build_channel_context(
     memory_store: &MemoryStore,
     status_block: &StatusBlock,
     _conversation_id: &str,
+    timezone_offset_hours: i32,
 ) -> Result<String> {
     let mut context = String::new();
 
@@ -27,7 +28,7 @@ pub async fn build_channel_context(
     context.push_str("\n\n");
 
     // Add status block
-    let status = status_block.render();
+    let status = status_block.render(timezone_offset_hours);
     if !status.is_empty() {
         context.push_str("## Current Status\n\n");
         context.push_str(&status);

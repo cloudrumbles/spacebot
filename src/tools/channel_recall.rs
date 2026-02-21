@@ -16,12 +16,18 @@ const MAX_TRANSCRIPT_MESSAGES: i64 = 100;
 pub struct ChannelRecallTool {
     conversation_logger: ConversationLogger,
     channel_store: ChannelStore,
+    timezone_offset_hours: i32,
 }
 
 impl ChannelRecallTool {
-    pub fn new(conversation_logger: ConversationLogger, channel_store: ChannelStore) -> Self {
+    pub fn new(
+        conversation_logger: ConversationLogger,
+        channel_store: ChannelStore,
+        timezone_offset_hours: i32,
+    ) -> Self {
         Self {
             conversation_logger,
+            timezone_offset_hours,
             channel_store,
         }
     }
@@ -149,7 +155,10 @@ impl Tool for ChannelRecallTool {
                 role: message.role.clone(),
                 sender: message.sender_name.clone(),
                 content: message.content.clone(),
-                timestamp: message.created_at.to_rfc3339(),
+                timestamp: crate::format_display_timestamp(
+                    message.created_at,
+                    self.timezone_offset_hours,
+                ),
             })
             .collect();
 
@@ -179,7 +188,10 @@ impl ChannelRecallTool {
             .map(|channel| ChannelListEntry {
                 channel_id: channel.id.clone(),
                 channel_name: channel.display_name.clone(),
-                last_activity: channel.last_activity_at.to_rfc3339(),
+                last_activity: crate::format_display_timestamp(
+                    channel.last_activity_at,
+                    self.timezone_offset_hours,
+                ),
             })
             .collect();
 

@@ -1,1 +1,17 @@
-Spawn an independent worker process. By default uses a built-in agent with {tools} tools. The worker only sees the task description you provide — no conversation history.{opencode_note}
+Spawn an independent worker process. By default this starts a builtin worker with {tools} tools. The worker only sees the task description you provide — no conversation history.{opencode_note}
+
+Field rules:
+- `task` is required and must be specific.
+- `interactive` is optional (default: `false`).
+- `skill` is optional, but only for builtin workers.
+- `task_type` is optional (`coding`, `summarization`, `deep_reasoning`).
+- `worker_type` is optional (default: `builtin`).
+- If `worker_type` is `opencode`, `directory` is required.
+
+Examples:
+- Builtin one-shot:
+  `{"task":"Run cargo test --lib and summarize failures"}`
+- Builtin interactive with routing hint:
+  `{"task":"Investigate flaky tests in messaging module","interactive":true,"task_type":"coding"}`
+- OpenCode worker:
+  `{"task":"Refactor cron tool validation and update tests","worker_type":"opencode","directory":"/home/shah/workspace/spacebot","interactive":true,"task_type":"coding"}`

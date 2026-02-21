@@ -462,17 +462,9 @@ impl Channel {
                 conversation_id = message.conversation_id.clone();
 
                 // Format with relative timestamp
-                let relative_secs = message
-                    .timestamp
-                    .signed_duration_since(first_timestamp)
-                    .num_seconds();
-                let relative_text = if relative_secs < 1 {
-                    "just now".to_string()
-                } else if relative_secs < 60 {
-                    format!("{}s ago", relative_secs)
-                } else {
-                    format!("{}m ago", relative_secs / 60)
-                };
+                let tz_offset = self.deps.runtime_config.display_timezone_offset_hours;
+                let relative_text =
+                    crate::format_display_timestamp(message.timestamp, tz_offset);
 
                 let display_name = message
                     .metadata
@@ -494,19 +486,20 @@ impl Channel {
                 user_contents.push(UserContent::text(formatted_text));
             }
         }
+        // Separate text and non-text (image/audio) content
+        let mut text_parts = Vec::new();
+        let mut attachment_parts = Vec::new();
+        for content in user_contents {
+            match content {
+                UserContent::Text(t) => text_parts.push(t.text.clone()),
+                other => attachment_parts.push(other),
+            }
+        }
 
-        // Combine all user content into a single text
         let combined_text = format!(
             "[{} messages arrived rapidly in this channel]\n\n{}",
             message_count,
-            user_contents
-                .iter()
-                .filter_map(|c| match c {
-                    UserContent::Text(t) => Some(t.text.clone()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
+            text_parts.join("\n")
         );
 
         // Build system prompt with coalesce hint
@@ -514,18 +507,18 @@ impl Channel {
             .build_system_prompt_with_coalesce(message_count, elapsed_secs, unique_sender_count)
             .await;
 
-        // Run agent turn
-        let (result, skip_flag) = self
+        // Run agent turn with any image/audio attachments preserved
+        let (result, skip_flag, replied_flag) = self
             .run_agent_turn(
                 &combined_text,
                 &system_prompt,
                 &conversation_id,
-                Vec::new(), // Attachments already formatted into text
+                attachment_parts,
             )
             .await?;
 
-        self.handle_agent_result(result, &skip_flag).await;
-
+        self.handle_agent_result(result, &skip_flag, &replied_flag)
+            .await;
         // Check compaction
         if let Err(error) = self.compactor.check_and_compact().await {
             tracing::warn!(channel_id = %self.id, %error, "compaction check failed");
@@ -572,7 +565,7 @@ impl Channel {
 
         let status_text = {
             let status = self.state.status_block.read().await;
-            status.render()
+            status.render(self.deps.runtime_config.display_timezone_offset_hours)
         };
 
         // Render coalesce hint
@@ -631,7 +624,11 @@ impl Channel {
             crate::MessageContent::Interaction { .. } => (message.content.to_string(), Vec::new()),
         };
 
-        let user_text = format_user_message(&raw_text, &message);
+        let user_text = format_user_message(
+            &raw_text,
+            &message,
+            self.deps.runtime_config.display_timezone_offset_hours,
+        );
 
         let attachment_content = if !attachments.is_empty() {
             download_attachments(&self.deps, &attachments).await
@@ -678,7 +675,7 @@ impl Channel {
 
         let system_prompt = self.build_system_prompt().await;
 
-        let (result, skip_flag) = self
+        let (result, skip_flag, replied_flag) = self
             .run_agent_turn(
                 &user_text,
                 &system_prompt,
@@ -687,7 +684,8 @@ impl Channel {
             )
             .await?;
 
-        self.handle_agent_result(result, &skip_flag).await;
+        self.handle_agent_result(result, &skip_flag, &replied_flag)
+            .await;
 
         // Check context size and trigger compaction if needed
         if let Err(error) = self.compactor.check_and_compact().await {
@@ -732,7 +730,7 @@ impl Channel {
 
         let status_text = {
             let status = self.state.status_block.read().await;
-            status.render()
+            status.render(self.deps.runtime_config.display_timezone_offset_hours)
         };
 
         let empty_to_none = |s: String| if s.is_empty() { None } else { Some(s) };
@@ -764,8 +762,10 @@ impl Channel {
     ) -> Result<(
         std::result::Result<String, rig::completion::PromptError>,
         crate::tools::SkipFlag,
+        crate::tools::RepliedFlag,
     )> {
         let skip_flag = crate::tools::new_skip_flag();
+        let replied_flag = crate::tools::new_replied_flag();
 
         let rc = &self.deps.runtime_config;
         let tool_search = Some(crate::tools::ToolSearchTool::new(rc.workspace_dir.clone()));
@@ -776,6 +776,7 @@ impl Channel {
             self.response_tx.clone(),
             conversation_id,
             skip_flag.clone(),
+            replied_flag.clone(),
             self.deps.cron_tool.clone(),
             tool_search,
         )
@@ -859,7 +860,7 @@ impl Channel {
             tracing::warn!(%error, "failed to remove channel tools");
         }
 
-        Ok((result, skip_flag))
+        Ok((result, skip_flag, replied_flag))
     }
 
     /// Dispatch the LLM result: send fallback text, log errors, clean up typing.
@@ -867,13 +868,17 @@ impl Channel {
         &self,
         result: std::result::Result<String, rig::completion::PromptError>,
         skip_flag: &crate::tools::SkipFlag,
+        replied_flag: &crate::tools::RepliedFlag,
     ) {
         match result {
             Ok(response) => {
                 let skipped = skip_flag.load(std::sync::atomic::Ordering::Relaxed);
+                let replied = replied_flag.load(std::sync::atomic::Ordering::Relaxed);
 
                 if skipped {
                     tracing::debug!(channel_id = %self.id, "channel turn skipped (no response)");
+                } else if replied {
+                    tracing::debug!(channel_id = %self.id, "channel turn replied via tool (fallback suppressed)");
                 } else {
                     // If the LLM returned text without using the reply tool, send it
                     // directly. Some models respond with text instead of tool calls.
@@ -881,17 +886,25 @@ impl Channel {
                     // attempt to extract the reply content and send that instead.
                     let text = response.trim();
                     let extracted = extract_reply_from_tool_syntax(text);
-                    let final_text = extracted.as_deref().unwrap_or(text);
+                    let source = self
+                        .conversation_id
+                        .as_deref()
+                        .and_then(|conversation_id| conversation_id.split(':').next())
+                        .unwrap_or("unknown");
+                    let final_text = crate::tools::reply::normalize_discord_mention_tokens(
+                        extracted.as_deref().unwrap_or(text),
+                        source,
+                    );
                     if !final_text.is_empty() {
                         if extracted.is_some() {
                             tracing::warn!(channel_id = %self.id, "extracted reply from malformed tool syntax in LLM text output");
                         }
                         self.state
                             .conversation_logger
-                            .log_bot_message(&self.state.channel_id, final_text);
+                            .log_bot_message(&self.state.channel_id, &final_text);
                         if let Err(error) = self
                             .response_tx
-                            .send(OutboundResponse::Text(final_text.to_string()))
+                            .send(OutboundResponse::Text(final_text))
                             .await
                         {
                             tracing::error!(%error, channel_id = %self.id, "failed to send fallback reply");
@@ -1093,7 +1106,7 @@ impl Channel {
     /// Get the current status block as a string.
     pub async fn get_status(&self) -> String {
         let status = self.state.status_block.read().await;
-        status.render()
+        status.render(self.deps.runtime_config.display_timezone_offset_hours)
     }
 
     /// Check if a memory persistence branch should be spawned based on message count.
@@ -1214,6 +1227,7 @@ async fn spawn_branch(
         state.deps.memory_search.clone(),
         state.conversation_logger.clone(),
         state.channel_store.clone(),
+        state.deps.runtime_config.display_timezone_offset_hours,
     );
     let branch_max_turns = **state.deps.runtime_config.branch_max_turns.load();
 
@@ -1589,7 +1603,7 @@ fn extract_reply_from_tool_syntax(text: &str) -> Option<String> {
 ///
 /// In multi-user channels, this lets the LLM distinguish who said what.
 /// System-generated messages (re-triggers) are passed through as-is.
-fn format_user_message(raw_text: &str, message: &InboundMessage) -> String {
+fn format_user_message(raw_text: &str, message: &InboundMessage, offset_hours: i32) -> String {
     if message.source == "system" {
         return raw_text.to_string();
     }
@@ -1618,7 +1632,8 @@ fn format_user_message(raw_text: &str, message: &InboundMessage) -> String {
         .map(|author| {
             let content_preview = message
                 .metadata
-                .get("reply_to_content")
+                .get("reply_to_text")
+                .or_else(|| message.metadata.get("reply_to_content"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             if content_preview.is_empty() {
@@ -1629,7 +1644,9 @@ fn format_user_message(raw_text: &str, message: &InboundMessage) -> String {
         })
         .unwrap_or_default();
 
-    format!("[{display_name}]{bot_tag}{reply_context}: {raw_text}")
+    let timestamp = crate::format_display_timestamp(message.timestamp, offset_hours);
+
+    format!("[{timestamp}] [{display_name}]{bot_tag}{reply_context}: {raw_text}")
 }
 
 /// Check if a ProcessEvent is targeted at a specific channel.

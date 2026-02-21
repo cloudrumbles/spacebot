@@ -25,7 +25,11 @@ pub struct CronJob {
     pub schedule: String,
     pub delivery_target: DeliveryTarget,
     pub enabled: bool,
+    pub run_once: bool,
     pub consecutive_failures: u32,
+    /// Maximum wall-clock seconds to wait for the job to complete.
+    /// `None` uses the default of 120 seconds.
+    pub timeout_secs: Option<u64>,
 }
 
 /// Where to send cron job results.
@@ -68,6 +72,11 @@ pub struct CronConfig {
     pub delivery_target: String,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    #[serde(default)]
+    pub run_once: bool,
+    /// Maximum wall-clock seconds to wait for the job to complete.
+    /// `None` uses the default of 120 seconds.
+    pub timeout_secs: Option<u64>,
 }
 
 fn default_schedule() -> String {
@@ -158,7 +167,9 @@ impl Scheduler {
             schedule: config.schedule.clone(),
             delivery_target,
             enabled: config.enabled,
+            run_once: config.run_once,
             consecutive_failures: 0,
+            timeout_secs: config.timeout_secs,
         };
 
         {
@@ -250,8 +261,8 @@ impl Scheduler {
 
                 let run_result = run_cron_job(&job, &context).await;
 
-                if is_one_shot {
-                    tracing::info!(cron_id = %job_id, "one-shot cron job completed; disabling");
+                if is_one_shot || job.run_once {
+                    tracing::info!(cron_id = %job_id, "one-shot/run-once cron job completed; disabling");
 
                     {
                         let mut j = jobs.write().await;
@@ -406,6 +417,57 @@ impl Scheduler {
 
     /// Update a job's enabled state and manage its timer accordingly.
     pub async fn set_enabled(&self, job_id: &str, enabled: bool) -> Result<()> {
+        // Try to find the job in the in-memory HashMap.
+        let in_memory = {
+            let jobs = self.jobs.read().await;
+            jobs.contains_key(job_id)
+        };
+
+        if !in_memory {
+            if !enabled {
+                tracing::debug!(cron_id = %job_id, "set_enabled(false): job not in scheduler, nothing to do");
+                return Ok(());
+            }
+
+            // Cold re-enable: job was disabled at startup so was never loaded into the scheduler.
+            // Reload from the store, insert, then start the timer.
+            tracing::info!(cron_id = %job_id, "cold re-enable: reloading config from store");
+            let configs = self.context.store.load_all_unfiltered().await?;
+            let config = configs
+                .into_iter()
+                .find(|c| c.id == job_id)
+                .ok_or_else(|| {
+                    crate::error::Error::Other(anyhow::anyhow!("cron job not found in store"))
+                })?;
+
+            let delivery_target =
+                DeliveryTarget::parse(&config.delivery_target).unwrap_or_else(|| DeliveryTarget {
+                    adapter: "unknown".into(),
+                    target: config.delivery_target.clone(),
+                });
+
+            {
+                let mut jobs = self.jobs.write().await;
+                jobs.insert(
+                    job_id.to_string(),
+                    CronJob {
+                        id: config.id.clone(),
+                        prompt: config.prompt,
+                        schedule: config.schedule,
+                        delivery_target,
+                        enabled: true,
+                        run_once: config.run_once,
+                        consecutive_failures: 0,
+                        timeout_secs: config.timeout_secs,
+                    },
+                );
+            }
+
+            self.start_timer(job_id).await;
+            tracing::info!(cron_id = %job_id, "cron job cold-re-enabled and timer started");
+            return Ok(());
+        }
+
         let was_enabled = {
             let mut jobs = self.jobs.write().await;
             if let Some(job) = jobs.get_mut(job_id) {
@@ -520,7 +582,7 @@ async fn run_cron_job(job: &CronJob, context: &CronContext) -> Result<()> {
     // Collect responses with a timeout. The channel may produce multiple messages
     // (e.g. status updates, then text). We only care about text responses.
     let mut collected_text = Vec::new();
-    let timeout = Duration::from_secs(120);
+    let timeout = Duration::from_secs(job.timeout_secs.unwrap_or(120));
 
     // Drop the sender so the channel knows no more messages are coming.
     // The channel will process the one message and then its event loop will end

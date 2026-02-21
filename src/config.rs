@@ -5,7 +5,7 @@ use crate::llm::routing::RoutingConfig;
 use anyhow::Context as _;
 use arc_swap::ArcSwap;
 use serde::{Deserialize, Deserializer};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -151,6 +151,7 @@ pub struct LlmConfig {
     pub moonshot_key: Option<String>,
     pub zai_coding_plan_key: Option<String>,
     pub google_antigravity_key: Option<String>,
+    pub gemini_key: Option<String>,
     pub providers: HashMap<String, ProviderConfig>,
 }
 
@@ -175,6 +176,7 @@ impl LlmConfig {
             || self.moonshot_key.is_some()
             || self.zai_coding_plan_key.is_some()
             || self.google_antigravity_key.is_some()
+            || self.gemini_key.is_some()
             || !self.providers.is_empty()
     }
 }
@@ -222,8 +224,10 @@ const MOONSHOT_PROVIDER_BASE_URL: &str = "https://api.moonshot.ai";
 const GOOGLE_ANTIGRAVITY_PROVIDER_BASE_URL: &str =
     "https://daily-cloudcode-pa.sandbox.googleapis.com";
 
+const GEMINI_PROVIDER_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta/openai";
 const ZHIPU_PROVIDER_BASE_URL: &str = "https://api.z.ai/api/paas/v4";
 const ZAI_CODING_PLAN_BASE_URL: &str = "https://api.z.ai/api/coding/paas/v4";
+const NVIDIA_PROVIDER_BASE_URL: &str = "https://integrate.api.nvidia.com";
 
 /// Defaults inherited by all agents. Individual agents can override any field.
 #[derive(Debug, Clone)]
@@ -251,6 +255,8 @@ pub struct DefaultsConfig {
     pub opencode: OpenCodeConfig,
     /// Worker log mode: "errors_only", "all_separate", or "all_combined".
     pub worker_log_mode: crate::settings::WorkerLogMode,
+    /// UTC offset in hours for displaying timestamps to the agent. Default 8 (GMT+8).
+    pub display_timezone_offset_hours: i32,
 }
 
 /// Compaction threshold configuration.
@@ -489,6 +495,8 @@ pub struct CronDef {
     /// Delivery target in "adapter:target" format (e.g. "telegram:525365593").
     pub delivery_target: String,
     pub enabled: bool,
+    pub run_once: bool,
+    pub timeout_secs: Option<u64>,
 }
 
 /// Fully resolved agent config (merged with defaults, paths resolved).
@@ -540,6 +548,7 @@ impl Default for DefaultsConfig {
             cron: Vec::new(),
             opencode: OpenCodeConfig::default(),
             worker_log_mode: crate::settings::WorkerLogMode::default(),
+            display_timezone_offset_hours: 8,
         }
     }
 }
@@ -645,6 +654,8 @@ pub struct Binding {
     pub chat_id: Option<String>,
     /// Channel IDs this binding applies to. If empty, all channels in the guild/workspace are allowed.
     pub channel_ids: Vec<String>,
+    /// Require explicit @mention (or reply-to-bot) for inbound messages.
+    pub require_mention: bool,
     /// User IDs allowed to DM the bot through this binding.
     pub dm_allowed_users: Vec<String>,
 }
@@ -654,6 +665,13 @@ impl Binding {
     fn matches(&self, message: &crate::InboundMessage) -> bool {
         if self.channel != message.source {
             return false;
+        }
+
+        // For webchat messages, match based on agent_id in the message
+        if message.source == "webchat" {
+            if let Some(message_agent_id) = &message.agent_id {
+                return message_agent_id.as_ref() == &self.agent_id;
+            }
         }
 
         // DM messages have no guild_id — match if the sender is in dm_allowed_users
@@ -808,6 +826,8 @@ pub struct SlackConfig {
 pub struct DiscordPermissions {
     pub guild_filter: Option<Vec<u64>>,
     pub channel_filter: std::collections::HashMap<u64, Vec<u64>>,
+    pub mention_required_guilds: Vec<u64>,
+    pub mention_required_channels: std::collections::HashMap<u64, Vec<u64>>,
     pub dm_allowed_users: Vec<u64>,
     pub allow_bot_messages: bool,
 }
@@ -906,6 +926,42 @@ impl DiscordPermissions {
             filter
         };
 
+        let mut mention_required_guilds: Vec<u64> = Vec::new();
+        let mention_required_channels = {
+            let mut filter: std::collections::HashMap<u64, Vec<u64>> =
+                std::collections::HashMap::new();
+
+            for binding in &discord_bindings {
+                if !binding.require_mention {
+                    continue;
+                }
+
+                if let Some(guild_id) = binding
+                    .guild_id
+                    .as_ref()
+                    .and_then(|g| g.parse::<u64>().ok())
+                {
+                    if binding.channel_ids.is_empty() {
+                        if !mention_required_guilds.contains(&guild_id) {
+                            mention_required_guilds.push(guild_id);
+                        }
+                        continue;
+                    }
+
+                    let channel_ids: Vec<u64> = binding
+                        .channel_ids
+                        .iter()
+                        .filter_map(|id| id.parse::<u64>().ok())
+                        .collect();
+                    if !channel_ids.is_empty() {
+                        filter.entry(guild_id).or_default().extend(channel_ids);
+                    }
+                }
+            }
+
+            filter
+        };
+
         let mut dm_allowed_users: Vec<u64> = discord
             .dm_allowed_users
             .iter()
@@ -926,6 +982,8 @@ impl DiscordPermissions {
         Self {
             guild_filter,
             channel_filter,
+            mention_required_guilds,
+            mention_required_channels,
             dm_allowed_users,
             allow_bot_messages: discord.allow_bot_messages,
         }
@@ -1172,6 +1230,7 @@ struct TomlLlmConfigFields {
     moonshot_key: Option<String>,
     zai_coding_plan_key: Option<String>,
     google_antigravity_key: Option<String>,
+    gemini_key: Option<String>,
     #[serde(default)]
     providers: HashMap<String, TomlProviderConfig>,
     #[serde(default)]
@@ -1199,6 +1258,7 @@ struct TomlLlmConfig {
     moonshot_key: Option<String>,
     zai_coding_plan_key: Option<String>,
     google_antigravity_key: Option<String>,
+    gemini_key: Option<String>,
     providers: HashMap<String, TomlProviderConfig>,
 }
 
@@ -1251,6 +1311,7 @@ impl<'de> Deserialize<'de> for TomlLlmConfig {
             moonshot_key: fields.moonshot_key,
             zai_coding_plan_key: fields.zai_coding_plan_key,
             google_antigravity_key: fields.google_antigravity_key,
+            gemini_key: fields.gemini_key,
             providers: fields.providers,
         })
     }
@@ -1275,6 +1336,7 @@ struct TomlDefaultsConfig {
     perplexity_search_key: Option<String>,
     opencode: Option<TomlOpenCodeConfig>,
     worker_log_mode: Option<String>,
+    display_timezone_offset_hours: Option<i32>,
 }
 
 #[derive(Deserialize, Default)]
@@ -1285,6 +1347,11 @@ struct TomlRoutingConfig {
     compactor: Option<String>,
     cortex: Option<String>,
     rate_limit_cooldown_secs: Option<u64>,
+    channel_thinking_effort: Option<String>,
+    branch_thinking_effort: Option<String>,
+    worker_thinking_effort: Option<String>,
+    compactor_thinking_effort: Option<String>,
+    cortex_thinking_effort: Option<String>,
     #[serde(default)]
     task_overrides: HashMap<String, String>,
     fallbacks: Option<HashMap<String, Vec<String>>>,
@@ -1394,6 +1461,9 @@ struct TomlCronDef {
     delivery_target: String,
     #[serde(default = "default_enabled")]
     enabled: bool,
+    #[serde(default)]
+    run_once: bool,
+    timeout_secs: Option<u64>,
 }
 
 fn default_schedule() -> String {
@@ -1490,6 +1560,8 @@ struct TomlBinding {
     #[serde(default)]
     channel_ids: Vec<String>,
     #[serde(default)]
+    require_mention: bool,
+    #[serde(default)]
     dm_allowed_users: Vec<String>,
 }
 
@@ -1559,6 +1631,61 @@ fn resolve_routing(toml: Option<TomlRoutingConfig>, base: &RoutingConfig) -> Rou
         rate_limit_cooldown_secs: t
             .rate_limit_cooldown_secs
             .unwrap_or(base.rate_limit_cooldown_secs),
+        channel_thinking_effort: t
+            .channel_thinking_effort
+            .unwrap_or_else(|| base.channel_thinking_effort.clone()),
+        branch_thinking_effort: t
+            .branch_thinking_effort
+            .unwrap_or_else(|| base.branch_thinking_effort.clone()),
+        worker_thinking_effort: t
+            .worker_thinking_effort
+            .unwrap_or_else(|| base.worker_thinking_effort.clone()),
+        compactor_thinking_effort: t
+            .compactor_thinking_effort
+            .unwrap_or_else(|| base.compactor_thinking_effort.clone()),
+        cortex_thinking_effort: t
+            .cortex_thinking_effort
+            .unwrap_or_else(|| base.cortex_thinking_effort.clone()),
+    }
+}
+
+/// For google-antigravity routing entries, auto-inject openrouter fallbacks
+/// when the user has openrouter credentials configured and no explicit
+/// fallbacks are set. Model mapping: strip `google-antigravity/` prefix,
+/// strip `-thinking` suffix, prepend `openrouter/anthropic/`.
+///
+/// For other fallback providers (e.g. gemini), configure explicitly in
+/// config.toml under `[defaults.routing]` `fallbacks`.
+fn inject_antigravity_fallbacks(routing: &mut RoutingConfig, llm: &LlmConfig) {
+    if !llm.providers.contains_key("openrouter") {
+        return;
+    }
+
+    let models: Vec<String> = [
+        &routing.channel,
+        &routing.branch,
+        &routing.worker,
+        &routing.compactor,
+        &routing.cortex,
+    ]
+    .into_iter()
+    .chain(routing.task_overrides.values())
+    .filter(|m| m.starts_with("google-antigravity/"))
+    .cloned()
+    .collect::<HashSet<_>>()
+    .into_iter()
+    .collect();
+
+    for model in models {
+        if routing.fallbacks.contains_key(&model) {
+            continue;
+        }
+        let bare = model
+            .strip_prefix("google-antigravity/")
+            .unwrap_or(&model);
+        let bare = bare.strip_suffix("-thinking").unwrap_or(bare);
+        let fallback = format!("openrouter/anthropic/{bare}");
+        routing.fallbacks.insert(model, vec![fallback]);
     }
 }
 
@@ -1582,6 +1709,11 @@ impl Config {
             return false;
         }
 
+        // OAuth credentials count as configured
+        if crate::auth::credentials_path(&instance_dir).exists() {
+            return false;
+        }
+
         // Check if we have any legacy env keys configured
         let has_legacy_keys = std::env::var("ANTHROPIC_API_KEY").is_ok()
             || std::env::var("OPENAI_API_KEY").is_ok()
@@ -1600,7 +1732,8 @@ impl Config {
             || std::env::var("MINIMAX_API_KEY").is_ok()
             || std::env::var("MOONSHOT_API_KEY").is_ok()
             || std::env::var("ZAI_CODING_PLAN_API_KEY").is_ok()
-            || std::env::var("GOOGLE_ANTIGRAVITY_API_KEY").is_ok();
+            || std::env::var("GOOGLE_ANTIGRAVITY_API_KEY").is_ok()
+            || std::env::var("GEMINI_API_KEY").is_ok();
 
         // If we have any legacy keys, no onboarding needed
         if has_legacy_keys {
@@ -1614,7 +1747,14 @@ impl Config {
                 || key.contains("PROVIDER") && key.contains("API_KEY")
         });
 
-        !has_provider_env_vars
+        // Also check for specific legacy env vars that can bootstrap
+        let has_legacy_bootstrap_vars = std::env::var("ANTHROPIC_API_KEY").is_ok()
+            || std::env::var("ANTHROPIC_OAUTH_TOKEN").is_ok()
+            || std::env::var("OPENAI_API_KEY").is_ok()
+            || std::env::var("OPENROUTER_API_KEY").is_ok()
+            || std::env::var("OPENCODE_ZEN_API_KEY").is_ok();
+
+        !has_provider_env_vars && !has_legacy_bootstrap_vars
     }
 
     /// Load configuration from the default config file, falling back to env vars.
@@ -1666,6 +1806,7 @@ impl Config {
             moonshot_key: std::env::var("MOONSHOT_API_KEY").ok(),
             zai_coding_plan_key: std::env::var("ZAI_CODING_PLAN_API_KEY").ok(),
             google_antigravity_key: std::env::var("GOOGLE_ANTIGRAVITY_API_KEY").ok(),
+            gemini_key: std::env::var("GEMINI_API_KEY").ok(),
             providers: HashMap::new(),
         };
 
@@ -1765,6 +1906,28 @@ impl Config {
                     api_type: ApiType::OpenAiCompletions,
                     base_url: GOOGLE_ANTIGRAVITY_PROVIDER_BASE_URL.to_string(),
                     api_key: google_antigravity_key,
+                    name: None,
+                });
+        }
+
+        if let Some(gemini_key) = llm.gemini_key.clone() {
+            llm.providers
+                .entry("gemini".to_string())
+                .or_insert_with(|| ProviderConfig {
+                    api_type: ApiType::OpenAiCompletions,
+                    base_url: GEMINI_PROVIDER_BASE_URL.to_string(),
+                    api_key: gemini_key,
+                    name: None,
+                });
+        }
+
+        if let Some(nvidia_key) = llm.nvidia_key.clone() {
+            llm.providers
+                .entry("nvidia".to_string())
+                .or_insert_with(|| ProviderConfig {
+                    api_type: ApiType::OpenAiCompletions,
+                    base_url: NVIDIA_PROVIDER_BASE_URL.to_string(),
+                    api_key: nvidia_key,
                     name: None,
                 });
         }
@@ -1971,6 +2134,12 @@ impl Config {
                 .as_deref()
                 .and_then(resolve_env_value)
                 .or_else(|| std::env::var("GOOGLE_ANTIGRAVITY_API_KEY").ok()),
+            gemini_key: toml
+                .llm
+                .gemini_key
+                .as_deref()
+                .and_then(resolve_env_value)
+                .or_else(|| std::env::var("GEMINI_API_KEY").ok()),
             providers: toml
                 .llm
                 .providers
@@ -2089,6 +2258,28 @@ impl Config {
                 });
         }
 
+        if let Some(gemini_key) = llm.gemini_key.clone() {
+            llm.providers
+                .entry("gemini".to_string())
+                .or_insert_with(|| ProviderConfig {
+                    api_type: ApiType::OpenAiCompletions,
+                    base_url: GEMINI_PROVIDER_BASE_URL.to_string(),
+                    api_key: gemini_key,
+                    name: None,
+                });
+        }
+
+        if let Some(nvidia_key) = llm.nvidia_key.clone() {
+            llm.providers
+                .entry("nvidia".to_string())
+                .or_insert_with(|| ProviderConfig {
+                    api_type: ApiType::OpenAiCompletions,
+                    base_url: NVIDIA_PROVIDER_BASE_URL.to_string(),
+                    api_key: nvidia_key,
+                    name: None,
+                });
+        }
+
         // Note: We allow boot without provider keys now. System starts in setup mode.
         // Agents are initialized later when keys are added via API.
 
@@ -2141,8 +2332,11 @@ impl Config {
         } else {
             base_defaults.web_search_backend
         };
+        let mut routing = resolve_routing(toml.defaults.routing, &base_defaults.routing);
+        inject_antigravity_fallbacks(&mut routing, &llm);
+
         let defaults = DefaultsConfig {
-            routing: resolve_routing(toml.defaults.routing, &base_defaults.routing),
+            routing,
             max_concurrent_branches: toml
                 .defaults
                 .max_concurrent_branches
@@ -2283,6 +2477,10 @@ impl Config {
                 .and_then(resolve_env_value)
                 .or_else(|| std::env::var("PERPLEXITY_API_KEY").ok()),
             history_backfill_count: base_defaults.history_backfill_count,
+            display_timezone_offset_hours: toml
+                .defaults
+                .display_timezone_offset_hours
+                .unwrap_or(base_defaults.display_timezone_offset_hours),
             cron: Vec::new(),
             opencode: toml
                 .defaults
@@ -2341,6 +2539,8 @@ impl Config {
                         schedule: h.schedule,
                         delivery_target: h.delivery_target,
                         enabled: h.enabled,
+                        run_once: h.run_once,
+                        timeout_secs: h.timeout_secs,
                     })
                     .collect();
 
@@ -2574,6 +2774,7 @@ impl Config {
                 workspace_id: b.workspace_id,
                 chat_id: b.chat_id,
                 channel_ids: b.channel_ids,
+                require_mention: b.require_mention,
                 dm_allowed_users: b.dm_allowed_users,
             })
             .collect();
@@ -2692,6 +2893,8 @@ pub struct RuntimeConfig {
     pub cron_scheduler: ArcSwap<Option<Arc<crate::cron::Scheduler>>>,
     /// Settings store for agent-specific configuration.
     pub settings: ArcSwap<Option<Arc<crate::settings::SettingsStore>>>,
+    /// UTC offset in hours for displaying timestamps to the agent.
+    pub display_timezone_offset_hours: i32,
 }
 
 impl RuntimeConfig {
@@ -2742,6 +2945,7 @@ impl RuntimeConfig {
             cron_store: ArcSwap::from_pointee(None),
             cron_scheduler: ArcSwap::from_pointee(None),
             settings: ArcSwap::from_pointee(None),
+            display_timezone_offset_hours: defaults.display_timezone_offset_hours,
         }
     }
 
@@ -3286,6 +3490,41 @@ pub fn run_onboarding() -> anyhow::Result<Option<PathBuf>> {
         .default(0)
         .interact()?;
 
+    // For Anthropic, offer OAuth login as an option
+    let anthropic_oauth = if provider_idx == 0 {
+        let auth_method = Select::new()
+            .with_prompt("How do you want to authenticate with Anthropic?")
+            .items(&[
+                "Log in with Claude Pro/Max (OAuth)",
+                "Log in via API Console (OAuth)",
+                "Enter an API key manually",
+            ])
+            .default(0)
+            .interact()?;
+
+        if auth_method <= 1 {
+            let mode = if auth_method == 0 {
+                crate::auth::AuthMode::Max
+            } else {
+                crate::auth::AuthMode::Console
+            };
+            let instance_dir = Config::default_instance_dir();
+            std::fs::create_dir_all(&instance_dir)?;
+
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .with_context(|| "failed to build tokio runtime")?;
+
+            runtime.block_on(crate::auth::login_interactive(&instance_dir, mode))?;
+            Some(true)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     let (provider_input_name, toml_key, provider_id) = match provider_idx {
         0 => ("Anthropic API key", "anthropic_key", "anthropic"),
         1 => ("OpenRouter API key", "openrouter_key", "openrouter"),
@@ -3310,8 +3549,12 @@ pub fn run_onboarding() -> anyhow::Result<Option<PathBuf>> {
     };
     let is_secret = provider_id != "ollama";
 
-    // 2. Get provider credential/endpoint
-    let provider_value = if is_secret {
+    // 2. Get provider credential/endpoint (skip if OAuth was used)
+    let provider_value = if anthropic_oauth.is_some() {
+        // OAuth tokens are stored in anthropic_oauth.json, not in config.toml.
+        // Use a placeholder so the config still has an [llm] section.
+        String::new()
+    } else if is_secret {
         let api_key: String = Password::new()
             .with_prompt(format!("Enter your {provider_input_name}"))
             .interact()?;
@@ -3425,7 +3668,11 @@ pub fn run_onboarding() -> anyhow::Result<Option<PathBuf>> {
 
     let mut config_content = String::new();
     config_content.push_str("[llm]\n");
-    config_content.push_str(&format!("{toml_key} = \"{provider_value}\"\n"));
+    if anthropic_oauth.is_some() {
+        config_content.push_str("# Anthropic authentication via OAuth (see anthropic_oauth.json)\n");
+    } else {
+        config_content.push_str(&format!("{toml_key} = \"{provider_value}\"\n"));
+    }
     config_content.push('\n');
 
     // Write routing defaults for the chosen provider
@@ -3509,11 +3756,26 @@ mod tests {
 
     impl EnvGuard {
         fn new() -> Self {
-            const KEYS: [&str; 4] = [
+            const KEYS: [&str; 19] = [
                 "SPACEBOT_DIR",
                 "ANTHROPIC_API_KEY",
+                "ANTHROPIC_OAUTH_TOKEN",
                 "OPENAI_API_KEY",
                 "OPENROUTER_API_KEY",
+                "ZHIPU_API_KEY",
+                "GROQ_API_KEY",
+                "TOGETHER_API_KEY",
+                "FIREWORKS_API_KEY",
+                "DEEPSEEK_API_KEY",
+                "XAI_API_KEY",
+                "MISTRAL_API_KEY",
+                "NVIDIA_API_KEY",
+                "OLLAMA_API_KEY",
+                "OLLAMA_BASE_URL",
+                "OPENCODE_ZEN_API_KEY",
+                "MINIMAX_API_KEY",
+                "MOONSHOT_API_KEY",
+                "ZAI_CODING_PLAN_API_KEY",
             ];
 
             let vars = KEYS
@@ -3764,6 +4026,25 @@ name = "Custom OpenAI"
         unsafe {
             std::env::set_var("ANTHROPIC_API_KEY", "test-key");
         }
+
+        assert!(!Config::needs_onboarding());
+    }
+
+    #[test]
+    fn test_needs_onboarding_false_with_oauth_credentials() {
+        let _lock = env_test_lock()
+            .lock()
+            .expect("failed to lock env test mutex");
+        let _env = EnvGuard::new();
+
+        // Create an OAuth credentials file in the EnvGuard's temp dir
+        let instance_dir = Config::default_instance_dir();
+        let creds = crate::auth::OAuthCredentials {
+            access_token: "sk-ant-oat01-test".to_string(),
+            refresh_token: "sk-ant-ort01-test".to_string(),
+            expires_at: chrono::Utc::now().timestamp_millis() + 3600_000,
+        };
+        crate::auth::save_credentials(&instance_dir, &creds).expect("failed to save credentials");
 
         assert!(!Config::needs_onboarding());
     }

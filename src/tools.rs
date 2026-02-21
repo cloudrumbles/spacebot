@@ -66,7 +66,7 @@ pub use memory_save::{
     AssociationInput, MemorySaveArgs, MemorySaveError, MemorySaveOutput, MemorySaveTool,
 };
 pub use react::{ReactArgs, ReactError, ReactOutput, ReactTool};
-pub use reply::{ReplyArgs, ReplyError, ReplyOutput, ReplyTool};
+pub use reply::{RepliedFlag, ReplyArgs, ReplyError, ReplyOutput, ReplyTool, new_replied_flag};
 pub use route::{RouteArgs, RouteError, RouteOutput, RouteTool};
 pub use send_file::{SendFileArgs, SendFileError, SendFileOutput, SendFileTool};
 pub use send_message_to_another_channel::{
@@ -120,6 +120,17 @@ pub fn truncate_output(value: &str, max_bytes: usize) -> String {
     )
 }
 
+fn infer_delivery_target_from_conversation_id(conversation_id: &str) -> Option<String> {
+    let (adapter, target) = conversation_id.split_once(':')?;
+    if adapter.is_empty() || target.is_empty() {
+        return None;
+    }
+    if adapter == "cron" || adapter == "system" {
+        return None;
+    }
+    Some(format!("{adapter}:{target}"))
+}
+
 /// Add per-turn tools to a channel's ToolServer.
 ///
 /// Called when a conversation turn begins. These tools hold per-turn state
@@ -131,16 +142,20 @@ pub async fn add_channel_tools(
     response_tx: mpsc::Sender<OutboundResponse>,
     conversation_id: impl Into<String>,
     skip_flag: SkipFlag,
+    replied_flag: RepliedFlag,
     cron_tool: Option<CronTool>,
     tool_search: Option<ToolSearchTool>,
 ) -> Result<(), rig::tool::server::ToolServerError> {
+    let conversation_id = conversation_id.into();
+    let default_delivery_target = infer_delivery_target_from_conversation_id(&conversation_id);
+
     handle
         .add_tool(ReplyTool::new(
             response_tx.clone(),
             conversation_id,
             state.conversation_logger.clone(),
             state.channel_id.clone(),
-            skip_flag.clone(),
+            replied_flag.clone(),
         ))
         .await?;
     handle.add_tool(BranchTool::new(state.clone())).await?;
@@ -163,7 +178,9 @@ pub async fn add_channel_tools(
         .await?;
     handle.add_tool(ReactTool::new(response_tx)).await?;
     if let Some(cron) = cron_tool {
-        handle.add_tool(cron).await?;
+        handle
+            .add_tool(cron.with_default_delivery_target(default_delivery_target))
+            .await?;
     }
     if let Some(ts) = tool_search {
         handle.add_tool(ts).await?;
@@ -203,12 +220,13 @@ pub fn create_branch_tool_server(
     memory_search: Arc<MemorySearch>,
     conversation_logger: crate::conversation::history::ConversationLogger,
     channel_store: crate::conversation::ChannelStore,
+    timezone_offset_hours: i32,
 ) -> ToolServerHandle {
     ToolServer::new()
         .tool(MemorySaveTool::new(memory_search.clone()))
-        .tool(MemoryRecallTool::new(memory_search.clone()))
+        .tool(MemoryRecallTool::new(memory_search.clone(), timezone_offset_hours))
         .tool(MemoryDeleteTool::new(memory_search))
-        .tool(ChannelRecallTool::new(conversation_logger, channel_store))
+        .tool(ChannelRecallTool::new(conversation_logger, channel_store, timezone_offset_hours))
         .run()
 }
 
@@ -276,12 +294,13 @@ pub fn create_cortex_chat_tool_server(
     web_search_provider: Option<WebSearchProviderConfig>,
     workspace: PathBuf,
     instance_dir: PathBuf,
+    timezone_offset_hours: i32,
 ) -> ToolServerHandle {
     let mut server = ToolServer::new()
         .tool(MemorySaveTool::new(memory_search.clone()))
-        .tool(MemoryRecallTool::new(memory_search.clone()))
+        .tool(MemoryRecallTool::new(memory_search.clone(), timezone_offset_hours))
         .tool(MemoryDeleteTool::new(memory_search))
-        .tool(ChannelRecallTool::new(conversation_logger, channel_store))
+        .tool(ChannelRecallTool::new(conversation_logger, channel_store, timezone_offset_hours))
         .tool(ShellTool::new(instance_dir.clone(), workspace.clone()))
         .tool(FileTool::new(workspace.clone()))
         .tool(ExecTool::new(instance_dir.clone(), workspace.clone()))

@@ -16,12 +16,16 @@ use std::sync::Arc;
 #[derive(Debug, Clone)]
 pub struct MemoryRecallTool {
     memory_search: Arc<MemorySearch>,
+    timezone_offset_hours: i32,
 }
 
 impl MemoryRecallTool {
     /// Create a new memory recall tool.
-    pub fn new(memory_search: Arc<MemorySearch>) -> Self {
-        Self { memory_search }
+    pub fn new(memory_search: Arc<MemorySearch>, timezone_offset_hours: i32) -> Self {
+        Self {
+            memory_search,
+            timezone_offset_hours,
+        }
     }
 }
 
@@ -246,7 +250,10 @@ impl Tool for MemoryRecallTool {
                 content: result.memory.content.clone(),
                 memory_type: result.memory.memory_type.to_string(),
                 importance: result.memory.importance,
-                created_at: result.memory.created_at.to_rfc3339(),
+                created_at: crate::format_display_timestamp(
+                    result.memory.created_at,
+                    self.timezone_offset_hours,
+                ),
                 relevance_score: result.score,
             });
         }
@@ -294,7 +301,7 @@ pub async fn memory_recall(
     query: &str,
     max_results: usize,
 ) -> Result<Vec<Memory>> {
-    let tool = MemoryRecallTool::new(Arc::clone(&memory_search));
+    let tool = MemoryRecallTool::new(Arc::clone(&memory_search), 0);
     let args = MemoryRecallArgs {
         query: Some(query.to_string()),
         max_results,

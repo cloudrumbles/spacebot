@@ -11,6 +11,18 @@ use sqlx::Row as _;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+fn hosted_agent_limit() -> Option<usize> {
+    let deployment = std::env::var("SPACEBOT_DEPLOYMENT").ok()?;
+    if !deployment.eq_ignore_ascii_case("hosted") {
+        return None;
+    }
+
+    std::env::var("SPACEBOT_MAX_AGENTS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+}
+
 #[derive(Serialize)]
 pub(super) struct AgentsResponse {
     agents: Vec<AgentInfo>,
@@ -57,6 +69,8 @@ struct CronJobInfo {
     schedule: String,
     delivery_target: String,
     enabled: bool,
+    run_once: bool,
+    timeout_secs: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -132,6 +146,16 @@ pub(super) async fn create_agent(
     State(state): State<Arc<ApiState>>,
     Json(request): Json<CreateAgentRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    if let Some(limit) = hosted_agent_limit() {
+        let existing = state.agent_configs.load();
+        if existing.len() >= limit {
+            return Ok(Json(serde_json::json!({
+                "success": false,
+                "message": format!("agent limit reached for this instance: up to {limit} agent{}", if limit == 1 { "" } else { "s" })
+            })));
+        }
+    }
+
     let agent_id = request.agent_id.trim().to_string();
     if agent_id.is_empty() {
         return Ok(Json(serde_json::json!({
@@ -381,6 +405,7 @@ pub(super) async fn create_agent(
         web_search_provider,
         runtime_config.workspace_dir.clone(),
         runtime_config.instance_dir.clone(),
+        runtime_config.display_timezone_offset_hours,
     );
     let cortex_store = crate::agent::cortex_chat::CortexChatStore::new(db.sqlite.clone());
     let cortex_session = crate::agent::cortex_chat::CortexChatSession::new(
@@ -637,7 +662,7 @@ pub(super) async fn agent_overview(
     let channel_count = channels.len();
 
     let cron_rows = sqlx::query(
-        "SELECT id, prompt, schedule, delivery_target, enabled FROM cron_jobs ORDER BY created_at ASC",
+        "SELECT id, prompt, schedule, delivery_target, enabled, run_once, timeout_secs FROM cron_jobs ORDER BY created_at ASC",
     )
     .fetch_all(pool)
     .await
@@ -651,6 +676,8 @@ pub(super) async fn agent_overview(
             schedule: row.get("schedule"),
             delivery_target: row.get("delivery_target"),
             enabled: row.get::<i64, _>("enabled") != 0,
+            run_once: row.try_get::<i64, _>("run_once").unwrap_or(0) != 0,
+            timeout_secs: row.try_get::<Option<i64>, _>("timeout_secs").ok().flatten().map(|t| t as u64),
         })
         .collect();
 

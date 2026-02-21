@@ -608,6 +608,7 @@ fn convert_messages_to_google_antigravity(
 ) -> Vec<serde_json::Value> {
     let mut result = Vec::new();
     let mut tool_call_names: HashMap<String, String> = HashMap::new();
+    let mut tool_call_wire_ids: HashMap<String, String> = HashMap::new();
 
     for message in messages.iter() {
         match message {
@@ -630,8 +631,10 @@ fn convert_messages_to_google_antigravity(
                             }
                         }
                         UserContent::ToolResult(tool_result) => {
+                            let lookup_id =
+                                tool_result.call_id.as_deref().unwrap_or(&tool_result.id);
                             let tool_name = tool_call_names
-                                .get(&tool_result.id)
+                                .get(lookup_id)
                                 .cloned()
                                 .unwrap_or_else(|| "tool".to_string());
 
@@ -645,8 +648,13 @@ fn convert_messages_to_google_antigravity(
                             });
 
                             if include_tool_call_id {
+                                let wire_id = tool_call_wire_ids
+                                    .get(lookup_id)
+                                    .cloned()
+                                    .or_else(|| tool_result.call_id.clone())
+                                    .unwrap_or_else(|| tool_result.id.clone());
                                 tool_result_part["functionResponse"]["id"] =
-                                    serde_json::json!(tool_result.id);
+                                    serde_json::json!(wire_id);
                             }
 
                             tool_result_parts.push(tool_result_part);
@@ -705,8 +713,19 @@ fn convert_messages_to_google_antigravity(
                             }
                         }
                         AssistantContent::ToolCall(tool_call) => {
-                            tool_call_names
-                                .insert(tool_call.id.clone(), tool_call.function.name.clone());
+                            let tool_name = tool_call.function.name.clone();
+                            let wire_id = tool_call
+                                .call_id
+                                .clone()
+                                .unwrap_or_else(|| tool_call.id.clone());
+
+                            tool_call_names.insert(tool_call.id.clone(), tool_name.clone());
+                            tool_call_wire_ids.insert(tool_call.id.clone(), wire_id.clone());
+
+                            if let Some(call_id) = &tool_call.call_id {
+                                tool_call_names.insert(call_id.clone(), tool_name.clone());
+                                tool_call_wire_ids.insert(call_id.clone(), wire_id.clone());
+                            }
 
                             let mut function_call = serde_json::json!({
                                 "name": tool_call.function.name,
@@ -714,7 +733,43 @@ fn convert_messages_to_google_antigravity(
                             });
 
                             if include_tool_call_id {
-                                function_call["id"] = serde_json::json!(tool_call.id);
+                                function_call["id"] = serde_json::json!(wire_id);
+                            }
+
+                            let thought_signature = tool_call
+                                .signature
+                                .clone()
+                                .filter(|signature| !signature.trim().is_empty())
+                                .or_else(|| {
+                                    tool_call
+                                        .additional_params
+                                        .as_ref()
+                                        .and_then(|params| {
+                                            params
+                                                .get("thoughtSignature")
+                                                .or_else(|| params.get("thought_signature"))
+                                        })
+                                        .and_then(|value| value.as_str())
+                                        .map(|value| value.to_string())
+                                });
+
+                            if let Some(signature) = thought_signature {
+                                function_call["thoughtSignature"] = serde_json::json!(signature);
+                            }
+
+                            if let Some(additional_params) = &tool_call.additional_params {
+                                if let Some(additional_object) = additional_params.as_object() {
+                                    if let Some(function_call_object) =
+                                        function_call.as_object_mut()
+                                    {
+                                        for (key, value) in additional_object {
+                                            if !function_call_object.contains_key(key) {
+                                                function_call_object
+                                                    .insert(key.clone(), value.clone());
+                                            }
+                                        }
+                                    }
+                                }
                             }
 
                             assistant_parts.push(serde_json::json!({
@@ -837,14 +892,60 @@ fn parse_google_antigravity_sse_response(
                         .cloned()
                         .unwrap_or_else(|| serde_json::json!({}));
 
-                    tool_calls.push(serde_json::json!({
+                    let thought_signature = function_call
+                        .get("thoughtSignature")
+                        .or_else(|| function_call.get("thought_signature"))
+                        .and_then(|value| value.as_str())
+                        .map(|value| value.trim())
+                        .filter(|value| !value.is_empty())
+                        .map(|value| value.to_string());
+
+                    let call_id = function_call
+                        .get("callId")
+                        .or_else(|| function_call.get("call_id"))
+                        .and_then(|value| value.as_str())
+                        .map(|value| value.trim())
+                        .filter(|value| !value.is_empty())
+                        .map(|value| value.to_string());
+
+                    let mut additional_params = serde_json::Map::new();
+                    for (key, value) in function_call {
+                        let is_reserved = matches!(
+                            key.as_str(),
+                            "name"
+                                | "args"
+                                | "id"
+                                | "callId"
+                                | "call_id"
+                                | "thoughtSignature"
+                                | "thought_signature"
+                        );
+                        if !is_reserved {
+                            additional_params.insert(key.clone(), value.clone());
+                        }
+                    }
+
+                    let mut tool_call_entry = serde_json::json!({
                         "id": tool_call_id,
                         "type": "function",
                         "function": {
                             "name": name,
                             "arguments": arguments,
                         }
-                    }));
+                    });
+
+                    if let Some(signature) = thought_signature {
+                        tool_call_entry["signature"] = serde_json::json!(signature);
+                    }
+                    if let Some(call_id) = call_id {
+                        tool_call_entry["call_id"] = serde_json::json!(call_id);
+                    }
+                    if !additional_params.is_empty() {
+                        tool_call_entry["additional_params"] =
+                            serde_json::Value::Object(additional_params);
+                    }
+
+                    tool_calls.push(tool_call_entry);
                 }
             }
         }
@@ -926,4 +1027,94 @@ fn parse_google_antigravity_sse_response(
     });
 
     parse_openai_response(completion_body, "Google Antigravity")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rig::message::{AssistantContent, Message, Text, ToolCall, ToolFunction};
+
+    #[test]
+    fn parse_google_antigravity_sse_response_preserves_tool_call_signature() {
+        let sse_payload = r#"data: {"response":{"candidates":[{"finishReason":"STOP","content":{"parts":[{"functionCall":{"id":"call_123","name":"default_api:reply","args":{"message":"hi"},"thoughtSignature":"sig_abc_123"}}]}}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":3,"totalTokenCount":13}}}"#;
+
+        let response = parse_google_antigravity_sse_response(sse_payload)
+            .expect("expected parser to handle tool call with thought signature");
+
+        let tool_call = response
+            .choice
+            .iter()
+            .find_map(|item| match item {
+                AssistantContent::ToolCall(tool_call) => Some(tool_call),
+                _ => None,
+            })
+            .expect("expected parsed response to contain a tool call");
+
+        assert_eq!(tool_call.id, "call_123");
+        assert_eq!(tool_call.function.name, "default_api:reply");
+        assert_eq!(tool_call.signature.as_deref(), Some("sig_abc_123"));
+    }
+
+    #[test]
+    fn convert_messages_to_google_antigravity_includes_thought_signature() {
+        let assistant_message = Message::Assistant {
+            id: Some("assistant-1".to_string()),
+            content: OneOrMany::one(AssistantContent::ToolCall(ToolCall {
+                id: "tool_call_1".to_string(),
+                call_id: None,
+                function: ToolFunction {
+                    name: "default_api:reply".to_string(),
+                    arguments: serde_json::json!({"message": "hello"}),
+                },
+                signature: Some("sig_xyz".to_string()),
+                additional_params: None,
+            })),
+        };
+
+        let messages = OneOrMany::one(assistant_message);
+        let converted = convert_messages_to_google_antigravity(&messages, true);
+        let function_call = &converted[0]["parts"][0]["functionCall"];
+
+        assert_eq!(function_call["thoughtSignature"].as_str(), Some("sig_xyz"));
+        assert_eq!(function_call["id"].as_str(), Some("tool_call_1"));
+    }
+
+    #[test]
+    fn convert_messages_to_google_antigravity_uses_tool_result_call_id_for_response() {
+        let assistant_message = Message::Assistant {
+            id: Some("assistant-1".to_string()),
+            content: OneOrMany::one(AssistantContent::ToolCall(ToolCall {
+                id: "tool_call_internal".to_string(),
+                call_id: Some("provider_call_id".to_string()),
+                function: ToolFunction {
+                    name: "default_api:reply".to_string(),
+                    arguments: serde_json::json!({"message": "hello"}),
+                },
+                signature: Some("sig_xyz".to_string()),
+                additional_params: None,
+            })),
+        };
+
+        let tool_result = rig::message::ToolResult {
+            id: "tool_call_internal".to_string(),
+            call_id: Some("provider_call_id".to_string()),
+            content: OneOrMany::one(rig::message::ToolResultContent::Text(Text {
+                text: "ok".to_string(),
+            })),
+        };
+
+        let user_message = Message::User {
+            content: OneOrMany::one(rig::message::UserContent::ToolResult(tool_result)),
+        };
+
+        let messages = OneOrMany::many(vec![assistant_message, user_message])
+            .expect("assistant + user messages should be valid");
+        let converted = convert_messages_to_google_antigravity(&messages, true);
+
+        let function_response_id = converted[1]["parts"][0]["functionResponse"]["id"]
+            .as_str()
+            .expect("function response id should be present");
+
+        assert_eq!(function_response_id, "provider_call_id");
+    }
 }

@@ -14,11 +14,21 @@ use std::sync::Arc;
 pub struct CronTool {
     store: Arc<CronStore>,
     scheduler: Arc<Scheduler>,
+    default_delivery_target: Option<String>,
 }
 
 impl CronTool {
     pub fn new(store: Arc<CronStore>, scheduler: Arc<Scheduler>) -> Self {
-        Self { store, scheduler }
+        Self {
+            store,
+            scheduler,
+            default_delivery_target: None,
+        }
+    }
+
+    pub fn with_default_delivery_target(mut self, delivery_target: Option<String>) -> Self {
+        self.default_delivery_target = delivery_target;
+        self
     }
 }
 
@@ -39,12 +49,20 @@ pub struct CronArgs {
     /// Required for "create": a cron expression defining the schedule (e.g. "0 9 * * *" for daily at 9am).
     #[serde(default)]
     pub schedule: Option<String>,
-    /// Required for "create": where to deliver results, in "adapter:target" format (e.g. "telegram:525365593").
-    #[serde(default)]
+    /// Legacy optional override for destination target.
+    /// If omitted, the cron tool defaults to the current channel target.
+    #[serde(default, alias = "channel_id")]
     pub delivery_target: Option<String>,
     /// Required for "delete": the ID of the cron job to remove.
     #[serde(default)]
     pub delete_id: Option<String>,
+    /// Optional for "create": maximum seconds to wait for the job to complete before timing out.
+    /// Defaults to 120. Use a larger value (e.g. 600) for long-running research or writing tasks.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+    /// Optional for "create": if true, the job runs once and then auto-disables.
+    #[serde(default)]
+    pub run_once: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -95,16 +113,47 @@ impl Tool for CronTool {
                         "type": "string",
                         "description": "For 'create': either a cron expression (e.g. '0 9 * * *' for daily at 9am, '*/5 * * * *' for every 5 minutes) or a one-shot timestamp ('@once:2026-02-20T14:30:00Z')."
                     },
-                    "delivery_target": {
-                        "type": "string",
-                        "description": "For 'create': where to send results, format 'adapter:target' (e.g. 'telegram:525365593')."
-                    },
                     "delete_id": {
                         "type": "string",
                         "description": "For 'delete': the ID of the cron job to remove."
+                    },
+                    "timeout_secs": {
+                        "type": "integer",
+                        "description": "For 'create': max seconds to wait for the job to finish (default 120). Use 600 for long-running tasks like research."
+                    },
+                    "run_once": {
+                        "type": "boolean",
+                        "description": "For 'create': if true, the job runs once and then auto-disables. Good for one-time reminders."
                     }
                 },
-                "required": ["action"]
+                "required": ["action"],
+                "allOf": [
+                    {
+                        "if": {
+                            "properties": {
+                                "action": { "const": "create" }
+                            },
+                            "required": ["action"]
+                        },
+                        "then": {
+                            "required": ["action", "id", "prompt", "schedule"]
+                        }
+                    },
+                    {
+                        "if": {
+                            "properties": {
+                                "action": { "const": "delete" }
+                            },
+                            "required": ["action"]
+                        },
+                        "then": {
+                            "anyOf": [
+                                { "required": ["delete_id"] },
+                                { "required": ["id"] }
+                            ]
+                        }
+                    }
+                ]
             }),
         }
     }
@@ -136,7 +185,13 @@ impl CronTool {
             .ok_or_else(|| CronError("'schedule' is required for create".into()))?;
         let delivery_target = args
             .delivery_target
-            .ok_or_else(|| CronError("'delivery_target' is required for create".into()))?;
+            .or_else(|| self.default_delivery_target.clone())
+            .ok_or_else(|| {
+                CronError(
+                    "unable to infer delivery target for create; this tool must run in a messaging channel"
+                        .into(),
+                )
+            })?;
 
         validate_schedule(&schedule)
             .map_err(|error| CronError(format!("invalid schedule '{schedule}': {error}")))?;
@@ -147,6 +202,8 @@ impl CronTool {
             schedule: schedule.clone(),
             delivery_target: delivery_target.clone(),
             enabled: true,
+            run_once: args.run_once.unwrap_or(false),
+            timeout_secs: args.timeout_secs,
         };
 
         // Persist to database
