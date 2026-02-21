@@ -144,7 +144,7 @@ impl StatusBlock {
     }
 
     /// Render the status block as a string for context injection.
-    pub fn render(&self) -> String {
+    pub fn render(&self, offset_hours: i32) -> String {
         let mut output = String::new();
 
         // Active workers
@@ -160,7 +160,7 @@ impl StatusBlock {
                     "- [{}] {} ({}{}): {}\n",
                     worker.id,
                     worker.task,
-                    worker.started_at.format("%H:%M"),
+                    crate::format_display_timestamp(worker.started_at, offset_hours),
                     tool_calls_str,
                     worker.status
                 ));
@@ -176,7 +176,7 @@ impl StatusBlock {
                     "- [{}] {} (started {})\n",
                     branch.id,
                     branch.description,
-                    branch.started_at.format("%H:%M:%S")
+                    crate::format_display_timestamp(branch.started_at, offset_hours)
                 ));
             }
             output.push('\n');

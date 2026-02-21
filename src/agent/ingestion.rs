@@ -476,6 +476,7 @@ async fn process_chunk(
         deps.memory_search.clone(),
         conversation_logger,
         channel_store,
+        deps.runtime_config.display_timezone_offset_hours,
     );
 
     let agent = AgentBuilder::new(model)

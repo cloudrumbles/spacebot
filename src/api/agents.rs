@@ -381,6 +381,7 @@ pub(super) async fn create_agent(
         web_search_provider,
         runtime_config.workspace_dir.clone(),
         runtime_config.instance_dir.clone(),
+        runtime_config.display_timezone_offset_hours,
     );
     let cortex_store = crate::agent::cortex_chat::CortexChatStore::new(db.sqlite.clone());
     let cortex_session = crate::agent::cortex_chat::CortexChatSession::new(

@@ -251,6 +251,8 @@ pub struct DefaultsConfig {
     pub opencode: OpenCodeConfig,
     /// Worker log mode: "errors_only", "all_separate", or "all_combined".
     pub worker_log_mode: crate::settings::WorkerLogMode,
+    /// UTC offset in hours for displaying timestamps to the agent. Default 8 (GMT+8).
+    pub display_timezone_offset_hours: i32,
 }
 
 /// Compaction threshold configuration.
@@ -540,6 +542,7 @@ impl Default for DefaultsConfig {
             cron: Vec::new(),
             opencode: OpenCodeConfig::default(),
             worker_log_mode: crate::settings::WorkerLogMode::default(),
+            display_timezone_offset_hours: 8,
         }
     }
 }
@@ -1275,6 +1278,7 @@ struct TomlDefaultsConfig {
     perplexity_search_key: Option<String>,
     opencode: Option<TomlOpenCodeConfig>,
     worker_log_mode: Option<String>,
+    display_timezone_offset_hours: Option<i32>,
 }
 
 #[derive(Deserialize, Default)]
@@ -2283,6 +2287,10 @@ impl Config {
                 .and_then(resolve_env_value)
                 .or_else(|| std::env::var("PERPLEXITY_API_KEY").ok()),
             history_backfill_count: base_defaults.history_backfill_count,
+            display_timezone_offset_hours: toml
+                .defaults
+                .display_timezone_offset_hours
+                .unwrap_or(base_defaults.display_timezone_offset_hours),
             cron: Vec::new(),
             opencode: toml
                 .defaults
@@ -2692,6 +2700,8 @@ pub struct RuntimeConfig {
     pub cron_scheduler: ArcSwap<Option<Arc<crate::cron::Scheduler>>>,
     /// Settings store for agent-specific configuration.
     pub settings: ArcSwap<Option<Arc<crate::settings::SettingsStore>>>,
+    /// UTC offset in hours for displaying timestamps to the agent.
+    pub display_timezone_offset_hours: i32,
 }
 
 impl RuntimeConfig {
@@ -2742,6 +2752,7 @@ impl RuntimeConfig {
             cron_store: ArcSwap::from_pointee(None),
             cron_scheduler: ArcSwap::from_pointee(None),
             settings: ArcSwap::from_pointee(None),
+            display_timezone_offset_hours: defaults.display_timezone_offset_hours,
         }
     }
 

@@ -219,12 +219,13 @@ pub fn create_branch_tool_server(
     memory_search: Arc<MemorySearch>,
     conversation_logger: crate::conversation::history::ConversationLogger,
     channel_store: crate::conversation::ChannelStore,
+    timezone_offset_hours: i32,
 ) -> ToolServerHandle {
     ToolServer::new()
         .tool(MemorySaveTool::new(memory_search.clone()))
-        .tool(MemoryRecallTool::new(memory_search.clone()))
+        .tool(MemoryRecallTool::new(memory_search.clone(), timezone_offset_hours))
         .tool(MemoryDeleteTool::new(memory_search))
-        .tool(ChannelRecallTool::new(conversation_logger, channel_store))
+        .tool(ChannelRecallTool::new(conversation_logger, channel_store, timezone_offset_hours))
         .run()
 }
 
@@ -292,12 +293,13 @@ pub fn create_cortex_chat_tool_server(
     web_search_provider: Option<WebSearchProviderConfig>,
     workspace: PathBuf,
     instance_dir: PathBuf,
+    timezone_offset_hours: i32,
 ) -> ToolServerHandle {
     let mut server = ToolServer::new()
         .tool(MemorySaveTool::new(memory_search.clone()))
-        .tool(MemoryRecallTool::new(memory_search.clone()))
+        .tool(MemoryRecallTool::new(memory_search.clone(), timezone_offset_hours))
         .tool(MemoryDeleteTool::new(memory_search))
-        .tool(ChannelRecallTool::new(conversation_logger, channel_store))
+        .tool(ChannelRecallTool::new(conversation_logger, channel_store, timezone_offset_hours))
         .tool(ShellTool::new(instance_dir.clone(), workspace.clone()))
         .tool(FileTool::new(workspace.clone()))
         .tool(ExecTool::new(instance_dir.clone(), workspace.clone()))

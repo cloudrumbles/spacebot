@@ -1659,6 +1659,7 @@ async fn initialize_agents(
                 web_search_provider,
                 agent.deps.runtime_config.workspace_dir.clone(),
                 agent.deps.runtime_config.instance_dir.clone(),
+                agent.deps.runtime_config.display_timezone_offset_hours,
             );
             let store = spacebot::agent::cortex_chat::CortexChatStore::new(agent.db.sqlite.clone());
             let session = spacebot::agent::cortex_chat::CortexChatSession::new(

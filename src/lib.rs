@@ -196,6 +196,23 @@ impl AgentDeps {
     }
 }
 
+/// Format a UTC timestamp for display to the agent, converted to a fixed UTC offset.
+///
+/// Produces a compact, unambiguous string like `Mon 2026-02-21 22:32+08`.
+/// The `offset_hours` comes from `RuntimeConfig::display_timezone_offset_hours`.
+pub fn format_display_timestamp(
+    dt: chrono::DateTime<chrono::Utc>,
+    offset_hours: i32,
+) -> String {
+    let offset = chrono::FixedOffset::east_opt(offset_hours * 3600)
+        .unwrap_or_else(|| chrono::FixedOffset::east_opt(0).unwrap());
+    let local = dt.with_timezone(&offset);
+    let sign = if offset_hours >= 0 { "+" } else { "-" };
+    local
+        .format(&format!("%a %Y-%m-%d %H:%M{sign}{:02}", offset_hours.abs()))
+        .to_string()
+}
+
 /// A running agent instance with all its isolated resources.
 pub struct Agent {
     pub id: AgentId,
