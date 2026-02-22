@@ -1646,7 +1646,7 @@ fn format_user_message(raw_text: &str, message: &InboundMessage, offset_hours: i
 
     let timestamp = crate::format_display_timestamp(message.timestamp, offset_hours);
 
-    format!("[{timestamp}] [{display_name}]{bot_tag}{reply_context}: {raw_text}")
+    format!("[{timestamp}]{bot_tag}{reply_context}: {raw_text}")
 }
 
 /// Check if a ProcessEvent is targeted at a specific channel.

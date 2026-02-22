@@ -1651,11 +1651,13 @@ fn resolve_routing(toml: Option<TomlRoutingConfig>, base: &RoutingConfig) -> Rou
 
 /// For google-antigravity routing entries, auto-inject openrouter fallbacks
 /// when the user has openrouter credentials configured and no explicit
-/// fallbacks are set. Model mapping: strip `google-antigravity/` prefix,
-/// strip `-thinking` suffix, prepend `openrouter/anthropic/`.
+/// fallbacks are set.
 ///
-/// For other fallback providers (e.g. gemini), configure explicitly in
-/// config.toml under `[defaults.routing]` `fallbacks`.
+/// Model mapping: strip `google-antigravity/` prefix, strip `-thinking`
+/// suffix, then route to the correct openrouter vendor based on model name:
+///   - `claude-*` → `openrouter/anthropic/<model>`
+///   - `gemini-*` → `openrouter/google/<model>`
+///   - anything else → skip (configure manually in config.toml)
 fn inject_antigravity_fallbacks(routing: &mut RoutingConfig, llm: &LlmConfig) {
     if !llm.providers.contains_key("openrouter") {
         return;
@@ -1684,7 +1686,16 @@ fn inject_antigravity_fallbacks(routing: &mut RoutingConfig, llm: &LlmConfig) {
             .strip_prefix("google-antigravity/")
             .unwrap_or(&model);
         let bare = bare.strip_suffix("-thinking").unwrap_or(bare);
-        let fallback = format!("openrouter/anthropic/{bare}");
+
+        let vendor = if bare.starts_with("claude-") {
+            "anthropic"
+        } else if bare.starts_with("gemini-") {
+            "google"
+        } else {
+            continue;
+        };
+
+        let fallback = format!("openrouter/{vendor}/{bare}");
         routing.fallbacks.insert(model, vec![fallback]);
     }
 }
